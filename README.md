@@ -23,7 +23,7 @@
 | `scripts/dev.sh` | 真正的构建/运行/压测脚本（MSYS2 环境、避开中文路径、并发生死锁规避） |
 | `lv_conf.h` | **LVGL 配置总开关**（内存池大小、断言、性能监视器，见"踩坑记录"第 4 条） |
 | `CMakeLists.txt` | 构建脚本（lvgl 作为子模块引入；`-DLV_MEM_SIZE` / `-DLV_DEBUG_ASSERT` / `-DLVGL_HAL`） |
-| `docs/` | 教程 + 部署/移植文档 + **《产品规划_智能家居中控台.md》**（三大功能的架构与里程碑）；**《SIP注册与配置体系.md》**（交付形态 / 配置分层 / 注册状态机）；**《开源组件清单与占比.md》**（依赖清单、许可义务、可裁剪空间） |
+| `docs/` | 教程 + 部署/移植文档 + **《产品规划_智能家居中控台.md》**（三大功能的架构与里程碑）；**《SIP注册与配置体系.md》**（交付形态 / 配置分层 / 注册状态机）；**《开源组件清单与占比.md》**（依赖清单、许可义务、可裁剪空间）；**《音频通路自测方案.md》**（不用声卡、不用手机，两条通路各自验收） |
 | `config/sip.ini.example` | **现场配置模板**（服务器/账号/端口/续期）；实际 `sip.ini` 不入库 |
 | `scripts/setup_windows_msys2.sh` | 一键环境搭建（Windows + MSYS2 + 国内镜像） |
 | `lvgl/` | 上游 LVGL 库（**git submodule，不纳入本仓库**，首次使用需拉取） |
@@ -244,6 +244,8 @@ make debug                  # 开断言跑，查越界/野指针
 | 20 | 手机开了 ICE 时，板子发出去的音频对方收不到 | offer 的 `c=` 行是 `0.0.0.0`，NAT 后端口也会变 | 对称 RTP（RFC 4961）：以**实收 RTP 包的源地址**校正回发目标，日志打 `[rtp] peer learned` |
 | 21 | 解码耗时测出来是 `0.00 ms`，比理论值低三个数量级 | FFmpeg 的 H.264 解码器在 `avcodec_send_packet()` 里真正做解码，`avcodec_receive_frame()` 只是从内部队列取帧（耗时≈0）。只给 receive 计时当然测不到 | 计时区间必须**包住 send + receive**，见 `tools/h264_probe` |
 | 22 | 手机配好账号后一直显示"注册失败"，日志里每秒一条 REGISTER | UAS 收到不支持的方法（REGISTER/MESSAGE/SUBSCRIBE）**静默丢弃**。RFC 3261 §8.2.1 要求回 405/501 终态响应；不回的话对端按 Timer E/G 无限重传，看起来像"板子不响应" | 兜底分支统一回 `405 Method Not Allowed` + `Allow` 头；`INFO`（带内 DTMF）回 200 |
+| 23 | 用同一份 WAV 当音源跑环回，每 10 秒听到一声"咔哒" | 音源**结尾停在大幅值、开头从 0 起**，循环时必然有一个跳变（实测相邻采样跳 4104）。而丢包的症状也是"咔哒" —— 差点去查一个不存在的问题 | 生成脚本对首尾各做 10ms 淡入淡出，循环点最大跳变降到 208（正常波形内）。**测试信号自己的毛病会被当成被测对象的毛病** |
+| 24 | 两端跑同一份编解码做环回，SNR 很好看，但不知道代码对不对 | 两端同源 → 对称的 bug 会**错得一模一样**，自己跟自己比永远是对的。用 `ffmpeg -c:a pcm_alaw -f alaw` 做独立参照，这才发现 65536 个输入里有 964 个码字不同（1.5%，只差 1 个量化级，集中在段边界） | 结论不是 bug：Sun 参考实现 vs ffmpeg 的就近取整，两种都合法，保留 Sun 那套（网关跑的是它）。**方法**比结论重要 |
 
 > 第 6 条排查口诀：`ldd main.exe` 看依赖 → 程序目录优先于 PATH → 要么自带 DLL，要么静态链接（`-static`）。
 > 第 7、8 条是同一类问题：**Windows 上构建失败的根因经常不在代码，而在"谁替你启动了编译器"**。
@@ -317,6 +319,18 @@ SIP_TONE=1 make run                                                          # �
 # → [rtp] stats rx=298 tx=299 dur=6s (pps=49.8)
 ```
 
+**音频甚至可以完全不碰声卡**：`SIP_AUDIO_SRC=file` 用 WAV 顶替麦克风、
+`SIP_AUDIO_SINK=file` 把收到的音频存成 WAV，两端各跑一份同一个二进制，
+就能把"发"和"收"两条通路分开验收，再用 SNR 比对代替"我听着像是对的"。
+详见 [`docs/音频通路自测方案.md`](docs/音频通路自测方案.md)。
+
+```bash
+# 12 秒通话，实测 tx=600 / rx=600 / lost=0 / loss=0.00%，落盘 96000 采样 = 12.00 秒
+SIP_AUDIO_SRC=file SIP_AUDIO_SRC_FILE=test_8k.wav SIP_AUDIO_SINK=file \
+SIP_AUDIO_SINK_FILE=rx.wav SIP_NO_REGISTER=1 make run
+python scripts/audio_compare.py test_8k.wav rx.wav     # → SNR 43.1 dB
+```
+
 ## 学习路线
 
 - [x] **Day 1**：环境搭建、编译、跑通官方 demo（Widgets）
@@ -326,7 +340,7 @@ SIP_TONE=1 make run                                                          # �
 - [x] **产品规划**：智能家居中控台三大功能拆解（`docs/产品规划_智能家居中控台.md`）
 - [x] **M1**：中控台骨架 —— flex/grid 主页 + **三级信息架构**（分类宫格 → 房间页签 → 设备详情）+ 设备模型 + 事件总线 + ini 持久化
 - [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析（**当前用 app_mock 模拟 ASR 事件**）
-- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**；另有板端自测工具 `tools/sip_echo`（纯 C 应答器，陪产品一起上板）。见 `docs/SIP联调环境.md`
+- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**；另有板端自测工具 `tools/sip_echo`（纯 C 应答器，陪产品一起上板）；音频收发两条通路已用 file↔file 方式独立验收（SNR 43.1 dB、丢包 0）。见 `docs/SIP联调环境.md`、`docs/音频通路自测方案.md`
 - [x] **M4（部分）**：中文按需子集字库（`scripts/gen_font.py` → `src/ui/fonts/`，212 汉字 × 16/24px），**修掉了"灯/调/风/插/线"显示成方框的问题**
 - [x] **OEM 定制层**（超出原计划）：`src/oem/` 一套接口 + 两套 profile，运行期 `OEM_PROFILE=alt` 热切换宫格/列表两套首页，见 `docs/OEM定制指南.md`
 - [ ] **M5**：全功能量化压测（每个里程碑过一遍 stress，出 stats.csv 曲线）

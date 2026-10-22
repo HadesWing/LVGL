@@ -118,6 +118,12 @@ typedef struct {
 static sip_call_t s_call;
 static uint32_t s_rtp_rx, s_rtp_tx;
 
+/* --- RTP 接收侧质量统计（只看收发个数会漏掉"丢了 5 个又重复 5 个"） --- */
+static uint16_t s_rtp_seq_exp;    /* 期望的下一个序号 */
+static uint32_t s_rtp_lost;       /* 序号跳跃累计的丢包数 */
+static uint32_t s_rtp_ooo;        /* 乱序/重复/跳变次数 */
+static bool     s_rtp_seq_ok;
+
 /* --- RTP 发送侧状态 --- */
 static uint16_t s_rtp_seq;
 static uint32_t s_rtp_ts;
@@ -125,7 +131,7 @@ static uint32_t s_rtp_ssrc;
 static uint64_t s_next_frame_ms;  /* 下一帧的发送时刻（按墙上时钟补帧，防欠载） */
 static bool     s_rtp_echo;      /* 无声卡时（CI）用回声验证媒体通路 */
 
-static void rtp_send_frame(int tone, const int16_t *sine8, int *phase);
+static void rtp_send_frame(void);
 
 /* --- 注册 --- */
 static int      s_expires = 3600;
@@ -321,18 +327,36 @@ static void rtp_start_media(void)
     s_rtp_ts   = (uint32_t)rand();
     s_rtp_ssrc = (uint32_t)rand();
     s_rtp_rx = s_rtp_tx = 0;
+    s_rtp_lost = s_rtp_ooo = 0;
+    s_rtp_seq_ok = false;
 
-    /* SIP_RTP_ECHO=1 时强制回声（CI/无声卡环境验证媒体通路用），否则尝试开声卡 */
+    /* SIP_RTP_ECHO=1 时强制回声（CI/无声卡环境验证媒体通路用），否则尝试开音频。
+       SIP_NO_AUDIO=1 = 纯信令，但仍要把路由解析一遍 —— 否则 SIP_TONE=1 会被
+       当成"没有音源"，上行一帧都不发（CI 回归就是这么挂的）。 */
     if (getenv("SIP_RTP_ECHO")) {
         s_rtp_echo = true;
     } else if (getenv("SIP_NO_AUDIO")) {
-        s_rtp_echo = false;      /* 纯信令回归：完全不碰声卡；发不发由 SIP_TONE 决定 */
+        app_audio_open();        /* 内部据 SIP_NO_AUDIO 走"不碰设备"的路由 */
+        s_rtp_echo = false;
     } else {
         s_rtp_echo = !app_audio_open();
     }
     printf("[rtp] media start: %s:%u pt=%u mode=%s\n",
            s_call.remote_ip, s_call.rtp_remote, s_call.payload,
-           s_rtp_echo ? "echo(无声卡)" : "audio");
+           s_rtp_echo ? "echo(无可用音频)" : app_audio_route_desc());
+    fflush(stdout);
+}
+
+/* 媒体统计：把"质量"和"数量"分开报。
+   rx=tx=250 也可能丢了 5 个又重复 5 个 —— 只看个数会被骗。 */
+static void rtp_print_stats(const char *why)
+{
+    int sec = app_sip_call_seconds();
+    double pps = sec > 0 ? (double)s_rtp_tx / (double)sec : 0.0;
+    uint32_t expect = s_rtp_rx + s_rtp_lost;
+    double loss = expect ? 100.0 * (double)s_rtp_lost / (double)expect : 0.0;
+    printf("[rtp] stats(%s) rx=%u tx=%u lost=%u ooo=%u loss=%.2f%% dur=%ds pps=%.1f\n",
+           why, s_rtp_rx, s_rtp_tx, s_rtp_lost, s_rtp_ooo, loss, sec, pps);
     fflush(stdout);
 }
 
@@ -893,10 +917,7 @@ int app_sip_hangup(void)
         idle_state();
         return 0;
     }
-    printf("[rtp] stats rx=%u tx=%u dur=%ds (pps=%.1f)\n", s_rtp_rx, s_rtp_tx,
-           app_sip_call_seconds(),
-           app_sip_call_seconds() > 0 ? (double)s_rtp_tx / app_sip_call_seconds() : 0.0);
-    fflush(stdout);
+    rtp_print_stats("hangup");
     rtp_stop_media();
     call_reset();
     s_rtp_rx = s_rtp_tx = 0;
@@ -1158,7 +1179,7 @@ static void handle_request(osip_message_t *msg, struct sockaddr_in *from)
         capture_request(msg, from, &h);
         send_reply(&h, 200, "OK", NULL, NULL);
         printf("[sip] call ended by peer\n");
-        printf("[rtp] stats rx=%u tx=%u dur=%ds\n", s_rtp_rx, s_rtp_tx, app_sip_call_seconds());
+        rtp_print_stats("peer bye");
         fflush(stdout);
         rtp_stop_media();
         call_reset();
@@ -1227,6 +1248,31 @@ static void rtp_on_readable(void)
     if (n <= 12) return;
     s_rtp_rx++;
 
+    /* 序号连续性：这是"音频有没有问题"最客观的一个数。
+       丢包 → 声音断续/咔哒；乱序 → 抖动了但能播（缓冲吸收）；
+       重复 → 通常是网络里有环路或对端重传逻辑有问题。
+       只看 rx 计数是不够的 —— 发了 250 个、收了 250 个，也可能丢了 5 个又重复 5 个。 */
+    {
+        uint16_t seq = (uint16_t)(((uint16_t)buf[2] << 8) | buf[3]);
+        if (!s_rtp_seq_ok) {
+            s_rtp_seq_exp = (uint16_t)(seq + 1);
+            s_rtp_seq_ok  = true;
+        } else {
+            int16_t diff = (int16_t)(seq - s_rtp_seq_exp);   /* 有符号回绕比较 */
+            if (diff == 0) {
+                s_rtp_seq_exp = (uint16_t)(seq + 1);
+            } else if (diff > 0) {
+                s_rtp_lost += (uint32_t)diff;                /* 中间少了 diff 个 */
+                s_rtp_seq_exp = (uint16_t)(seq + 1);
+            } else if (diff > -100) {
+                s_rtp_ooo++;                                 /* 迟到/乱序 */
+            } else {
+                s_rtp_ooo++;                                 /* 剧烈跳变（对端重启了 ts/seq） */
+                s_rtp_seq_exp = (uint16_t)(seq + 1);
+            }
+        }
+    }
+
     /* 对称 RTP（RFC 4961）：以"实际收到包的源地址"为准回发，而不是照 SDP 里写的发。
        手机 Linphone 开了 ICE 时 offer 的 c= 行是 0.0.0.0，NAT 后面端口也会变，
        照 SDP 发等于发给空气 —— 症状是"手机能听到板子？不，是板子听不到手机 / 手机听不到板子"。
@@ -1276,17 +1322,11 @@ static void rtp_on_readable(void)
  *---------------------------------------------------------------------------*/
 static void rtp_tx_tick(void)
 {
-    /* 自测音源：1kHz 正弦（8kHz 采样下一个周期正好 8 个点，用查表免掉 math.h）。
-       用途：没有麦克风的工控机/CI 上验证"编码→RTP→解码"整条链路；
-       板子上也可以拿它做对讲自检（喇叭里应听到"嘟——"）。 */
-    static const int16_t sine8[8] = { 0, 11585, 16384, 11585, 0, -11585, -16384, -11585 };
-    static int sine_phase;
-    static int tone = -1;
-    if (tone < 0) tone = getenv("SIP_TONE") ? 1 : 0;
-
     if (s_state != SIP_INCALL || !s_call.answered) { s_next_frame_ms = 0; return; }
     if (s_rtp_echo || s_rtp == SOCK_INVALID || s_call.rtp_remote == 0) { s_next_frame_ms = 0; return; }
-    if (!tone && !app_audio_can_record()) { s_next_frame_ms = 0; return; }
+    /* 音源取不到数（没麦克风、也没配文件源/tone、或 src=none）= 只收不发。
+       这不是"故障"，是自测里"关掉麦克风只验接收"的正当姿态。 */
+    if (!app_audio_can_record()) { s_next_frame_ms = 0; return; }
 
     /* 按"墙上时钟"补帧：一次 tick 里把落后的帧补齐（最多 3 帧），
        否则 select 每轮 33ms 就只能发 1 帧 → 32kbps 而不是 64kbps，
@@ -1297,7 +1337,7 @@ static void rtp_tx_tick(void)
 
     int sent = 0;
     while (s_next_frame_ms <= now && sent < 3) {
-        rtp_send_frame(tone, sine8, &sine_phase);
+        rtp_send_frame();
         s_next_frame_ms += 20;
         sent++;
     }
@@ -1305,22 +1345,14 @@ static void rtp_tx_tick(void)
         s_next_frame_ms = now;   /* 长时间没发（切网/挂起），直接对齐，不要一次补几百帧 */
 }
 
-/* 发一帧 20ms，编码按协商的 payload（8=PCMA / 0=PCMU） */
-static void rtp_send_frame(int tone, const int16_t *sine8, int *phase)
+/* 发一帧 20ms，编码按协商的 payload（8=PCMA / 0=PCMU）
+   音源由 app_audio 决定：mic / file / tone 都走这里，上层不再关心。 */
+static void rtp_send_frame(void)
 {
     uint8_t pkt[12 + G711_FRAME_SAMPLES];
     int16_t pcm[G711_FRAME_SAMPLES];
 
-    int got = 0;
-    if (tone) {
-        for (int i = 0; i < G711_FRAME_SAMPLES; i++) {
-            pcm[i] = sine8[*phase & 7];
-            (*phase)++;
-        }
-        got = G711_FRAME_SAMPLES;
-    } else {
-        got = app_audio_read(pcm, G711_FRAME_SAMPLES);
-    }
+    int got = app_audio_read(pcm, G711_FRAME_SAMPLES);
     if (got < G711_FRAME_SAMPLES)
         memset(pcm + got, 0, (size_t)(G711_FRAME_SAMPLES - got) * sizeof(int16_t));
 

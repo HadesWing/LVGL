@@ -24,6 +24,11 @@ third_party/osip-install/
 Thumbs.db
 desktop.ini
 
+# 自测产出的音频（音源可由 scripts/gen_test_wav.py 重新生成，落盘文件是调试残留）
+bin/*.wav
+bin/*.alaw
+bin/*.raw
+
 # 编译中间文件
 *.obj
 *.o
