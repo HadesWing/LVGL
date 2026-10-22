@@ -243,6 +243,7 @@ make debug                  # 开断言跑，查越界/野指针
 | 19 | 不填 `SIP_SERVER` 的点对点模式下，双方都静音、信令却全对 | `detect_local_ip()` 原本朝服务器地址探测网卡，没服务器时探测失败 → `s_local_ip` 停在 `127.0.0.1` → SDP 里 `c=IN IP4 127.0.0.1` 发给对端，对端把音频**发给自己** | 无服务器时回退到 `8.8.8.8:53` 探测默认路由（UDP connect 不发包）；另加 `SIP_LOCAL_IP` 人工覆盖，**板子多网卡必用** |
 | 20 | 手机开了 ICE 时，板子发出去的音频对方收不到 | offer 的 `c=` 行是 `0.0.0.0`，NAT 后端口也会变 | 对称 RTP（RFC 4961）：以**实收 RTP 包的源地址**校正回发目标，日志打 `[rtp] peer learned` |
 | 21 | 解码耗时测出来是 `0.00 ms`，比理论值低三个数量级 | FFmpeg 的 H.264 解码器在 `avcodec_send_packet()` 里真正做解码，`avcodec_receive_frame()` 只是从内部队列取帧（耗时≈0）。只给 receive 计时当然测不到 | 计时区间必须**包住 send + receive**，见 `tools/h264_probe` |
+| 22 | 手机配好账号后一直显示"注册失败"，日志里每秒一条 REGISTER | UAS 收到不支持的方法（REGISTER/MESSAGE/SUBSCRIBE）**静默丢弃**。RFC 3261 §8.2.1 要求回 405/501 终态响应；不回的话对端按 Timer E/G 无限重传，看起来像"板子不响应" | 兜底分支统一回 `405 Method Not Allowed` + `Allow` 头；`INFO`（带内 DTMF）回 200 |
 
 > 第 6 条排查口诀：`ldd main.exe` 看依赖 → 程序目录优先于 PATH → 要么自带 DLL，要么静态链接（`-static`）。
 > 第 7、8 条是同一类问题：**Windows 上构建失败的根因经常不在代码，而在"谁替你启动了编译器"**。

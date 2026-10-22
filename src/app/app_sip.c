@@ -1188,6 +1188,29 @@ static void handle_request(osip_message_t *msg, struct sockaddr_in *from)
         idle_state();
         return;
     }
+
+    /* 带内按键（RFC 2976 INFO），软电话发 DTMF 常用这个而不是 RFC 2833 */
+    if (strcmp(method, "INFO") == 0) {
+        sip_hdrs_t h;
+        capture_request(msg, from, &h);
+        send_reply(&h, 200, "OK", NULL, NULL);
+        return;
+    }
+
+    /* 兜底：任何没实现的方法都必须回一个终态响应。
+       RFC 3261 §8.2.1 要求 UAS 对不支持的方法回 405（或 501），
+       不回的实际后果 = 对端按 Timer E/G 反复重传，日志里每秒一条，
+       手机端表现为"注册一直失败 / 呼叫发不出去"，而抓包看我们全收到了。
+       点对点模式（no_register=1）下，Linphone 建账号时正好会把
+       REGISTER 发到板子上，就落进这个分支。 */
+    {
+        sip_hdrs_t h;
+        capture_request(msg, from, &h);
+        send_reply(&h, 405, "Method Not Allowed",
+                   "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, INFO\r\n", NULL);
+        printf("[sip] %s not supported -> 405\n", method);
+        fflush(stdout);
+    }
 }
 
 /*---------------------------------------------------------------------------
