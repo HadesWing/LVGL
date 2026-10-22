@@ -29,6 +29,7 @@
 
 #include "hal/hal.h"
 #include "ui/ui_home.h"
+#include "ui/ui_call.h"
 #include "ui/ui_theme.h"
 #include "app/app_events.h"
 #include "app/app_devices.h"
@@ -91,6 +92,7 @@ int main(int argc, char **argv)
   app_events_init();              /* ← 事件总线（主线程分发 timer） */
   app_devices_init();             /* ← 设备模型（加载持久化状态） */
   ui_home_init();                 /* ← M1：智能家居中控台主页 */
+  ui_call_init();                 /* ← M3：对讲页（来电/通话中，靠事件驱动） */
   app_stats_init();               /* ← 内存/帧率/循环耗时埋点 */
   app_mock_init();                /* ← 设备事件模拟（无板联调用） */
 

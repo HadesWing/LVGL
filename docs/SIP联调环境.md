@@ -111,10 +111,60 @@ MicroSIP 支持 direct IP call，不需要注册、不需要 SIP 服务器：
 - 我们侧：所有收发都有 `[sip] >>` / `[sip] <<` 日志；
 - 需要第三方视角时装 Wireshark，过滤 `sip || rtp`，本机回环流量也能抓到。
 
-## 四、路线图
+## 四、自测开关（无界面也能跑全链路）
+
+客户端内置四个环境变量开关，用于 CI / 无人工点击的回归：
+
+| 变量 | 作用 |
+|------|------|
+| `SIP_AUTOANSWER=1` | 收到 INVITE 自动 200 接听（跳过 UI 点"接听"） |
+| `SIP_AUTOCALL=<号码>` | 注册成功后自动呼出指定号码 |
+| `SIP_AUTOHANGUP=<秒>` | 通话 N 秒后自动挂断（发 BYE） |
+| `SIP_DEBUG=1` | 打印 ACK 原文等调试细节 |
+
+### 双实例互拨（走真服务器，最接近产品形态）
+
+```bash
+# 终端 1：101 自动接听
+SIP_SERVER=127.0.0.1 SIP_PORT=5060 SIP_USER=101 SIP_PASS=101 \
+  SIP_LOCAL_PORT=5064 SIP_AUTOANSWER=1 ./bin/main.exe
+
+# 终端 2：100 注册后自动呼 101，通话 3 秒挂断
+SIP_SERVER=127.0.0.1 SIP_PORT=5060 SIP_USER=100 SIP_PASS=100 \
+  SIP_LOCAL_PORT=5062 SIP_AUTOCALL=101 SIP_AUTOHANGUP=3 ./bin/main.exe
+```
+
+实测通过（miniSIPServer V70）：
+```
+A(100): REGISTER→401→auth→200 → INVITE → 100 → 200 → ACK → BYE → 200
+B(101): INVITE → 100 Trying → 180 Ringing → 200(SDP) → ACK → BYE → 200
+两侧通话页压栈/出栈正常，内存回落基线 28.5KB（无泄漏）
+```
+
+### 脚本化 UAC（不需要第二个实例）
+
+```bash
+python scripts/fake_sip_caller.py 5062 1001
+# INVITE → 100/180/200 → ACK → 50 个 RTP 包（全数回声）→ BYE → 200
+```
+
+## 五、本轮踩到的三个协议坑（都是真问题）
+
+| 坑 | 现象 | 根因/解法 |
+|----|------|-----------|
+| **ACK 的 CSeq 不能自增** | 对端不停重传 200 OK，日志刷屏 | 2xx 的 ACK 必须与 INVITE **同号**（都是 1）；只有 BYE 才是新事务 +1 |
+| **ACK 要用 Contact 地址** | 发到代理地址，对话匹配失败 | ACK/BYE 是端到端，Request-URI 取 200 OK 的 Contact；解析失败才退回响应源地址 |
+| **To 头必须原样回填** | 同上（匹配不上对话） | 用 200 OK 里的 To 原文（含 tag），不要自己拼 URI |
+
+## 六、路线图
 
 - [x] REGISTER / 200 OK（UDP，select 收包线程）
 - [x] 401 Digest 认证（MD5，qop=auth / 无 qop 双支持）
-- [ ] INVITE / 200 OK / ACK / BYE（对话内 cseq、To-tag 维护）
-- [ ] 呼入振铃 UI（`SIP_INCOMING` 状态已有事件，`ui_call.c` 待写）
-- [ ] RTP 音频（PCMA 8k，先 loopback 自测）
+- [x] INVITE 呼入：100 Trying → 180 Ringing → 200 OK(SDP) → ACK → BYE/200
+- [x] INVITE 呼出：带 SDP，按 Contact 发 ACK
+- [x] 对讲页 `ui_call.c`：来电（接听/拒接）+ 通话中（计时、RTP 收发计数），事件驱动压/出栈
+- [x] RTP 回声（PCMA 160B/20ms），无板验证双向媒体
+- [x] 非 SIP 杂包过滤（真实网络里会有扫描包，不再刷屏报错）
+- [ ] 真实音频采集/播放（板端 ALSA 或 PC 端 SDL 录音，M6 一并做）
+- [ ] 视频（H.264 解码 + lv_image 显示，室内机产品形态必需）
+- [ ] 通话中 401 认证、CANCEL、事务层重传（eXosip 迁移时一并解决）

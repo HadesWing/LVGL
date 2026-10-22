@@ -56,15 +56,71 @@ def main():
         first = text.split("\r\n", 1)[0]
         print(f"[fake-sip] << {addr[0]}:{addr[1]}  {first}", flush=True)
 
-        if not first.startswith("REGISTER"):
-            print("[fake-sip] not REGISTER, ignore", flush=True)
-            continue
-
         via = header(text, "Via")
         frm = header(text, "From")
         to = header(text, "To")
         call_id = header(text, "Call-ID")
         cseq = header(text, "CSeq")
+
+        # ---------------- INVITE：当作被叫（UAS），直接 100/180/200 ----------------
+        if first.startswith("INVITE"):
+            sdp = (
+                "v=0\r\n"
+                "o=- 2 2 IN IP4 127.0.0.1\r\n"
+                "s=fake-uas\r\n"
+                "c=IN IP4 127.0.0.1\r\n"
+                "t=0 0\r\n"
+                "m=audio 4300 RTP/AVP 8\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=sendrecv\r\n"
+            )
+            to_tagged = to + ";tag=uas67890" if to and "tag=" not in to else to
+
+            def send(code, reason, body=None, extra=""):
+                head = (
+                    f"SIP/2.0 {code} {reason}\r\n"
+                    f"Via: {via}\r\n"
+                    f"From: {frm}\r\n"
+                    f"To: {to_tagged}\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq}\r\n"
+                    f"Contact: <sip:1002@127.0.0.1:{port}>\r\n"
+                    + extra
+                )
+                if body:
+                    head += "Content-Type: application/sdp\r\n"
+                head += f"Content-Length: {len(body) if body else 0}\r\n\r\n"
+                sock.sendto((head + (body or "")).encode(), addr)
+                print(f"[fake-sip] >> {code} {reason}", flush=True)
+
+            send(100, "Trying")
+            send(180, "Ringing")
+            send(200, "OK", sdp)
+            continue
+
+        if first.startswith("ACK"):
+            print("[fake-sip] << ACK (call established)", flush=True)
+            continue
+
+        if first.startswith("BYE"):
+            to_tagged = to + ";tag=uas67890" if to and "tag=" not in to else to
+            resp = (
+                "SIP/2.0 200 OK\r\n"
+                f"Via: {via}\r\n"
+                f"From: {frm}\r\n"
+                f"To: {to_tagged}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                "Content-Length: 0\r\n\r\n"
+            )
+            sock.sendto(resp.encode(), addr)
+            print("[fake-sip] >> 200 OK (BYE)", flush=True)
+            continue
+
+        if not first.startswith("REGISTER"):
+            print("[fake-sip] other request, ignore", flush=True)
+            continue
+
         authz = header(text, "Authorization")
 
         def reply(code, reason, extra=""):

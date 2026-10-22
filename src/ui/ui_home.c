@@ -16,6 +16,9 @@
 #include "ui_theme.h"
 #include "app_devices.h"
 #include "app_events.h"
+#ifdef APP_WITH_SIP
+#include "app_sip.h"
+#endif
 #include "lvgl.h"
 
 #include <stdio.h>
@@ -45,8 +48,20 @@ static void on_sip_state(const app_event_t *e, void *user)
     switch (e->arg0) {
     case 1:  lv_label_set_text(s_sip_lbl, "SIP 在线");  break;
     case 2:  lv_label_set_text(s_sip_lbl, "SIP 来电!"); break;
+    case 3:  lv_label_set_text(s_sip_lbl, "通话中");    break;
+    case 4:  lv_label_set_text(s_sip_lbl, "呼出中");    break;
     default: lv_label_set_text(s_sip_lbl, "SIP 离线");  break;
     }
+}
+
+/* 点状态栏的 SIP 文字 = 呼叫门口机（对端号码由环境变量 SIP_PEER 指定，默认 1002） */
+static void sip_lbl_click_cb(lv_event_t *e)
+{
+    (void)e;
+#ifdef APP_WITH_SIP
+    const char *peer = getenv("SIP_PEER");
+    app_sip_call((peer && *peer) ? peer : "1002");
+#endif
 }
 
 /*---------------------------------------------------------------------------
@@ -150,6 +165,9 @@ void ui_home_init(void)
     lv_obj_add_style(s_sip_lbl, &st_bar_text, 0);
     lv_obj_set_style_text_font(s_sip_lbl, FONT_CJK, 0);
     lv_label_set_text(s_sip_lbl, "SIP 离线");
+    lv_obj_set_style_pad_all(s_sip_lbl, 6, 0);          /* 扩大点击热区 */
+    lv_obj_set_clickable(s_sip_lbl, true);
+    lv_obj_add_event_cb(s_sip_lbl, sip_lbl_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* ---------- 标题 ---------- */
     lv_obj_t *title = lv_label_create(scr);

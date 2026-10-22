@@ -258,9 +258,9 @@ make debug                  # 开断言跑，查越界/野指针
 - [x] **Day 2-e**：内存与性能量化（`lv_mem_monitor` / FPS / 主循环耗时 / 30 秒压测零泄漏）
 - [x] **Day 2-g**：一键构建（`make build` / `make run` / 内存与压测变体）
 - [x] **产品规划**：智能家居中控台三大功能拆解（`docs/产品规划_智能家居中控台.md`）
-- [x] **M1**：中控台骨架 —— flex/grid 主页（状态栏/房间页签/设备卡片网格/场景条）+ 设备模型 + 事件总线；页面栈留 M3 对讲页接入
-- [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析
-- [ ] **M3**：SIP 对讲 —— 呼叫状态机 + 来电横幅 + 对讲页
+- [x] **M1**：中控台骨架 —— flex/grid 主页 + **三级信息架构**（分类宫格 → 房间页签 → 设备详情）+ 设备模型 + 事件总线 + ini 持久化
+- [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析（**当前用 app_mock 模拟 ASR 事件**）
+- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest、INVITE 双向、ACK/BYE、RTP 回声）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测通过，见 `docs/SIP联调环境.md`
 - [ ] **M4**：中文点阵字体（lv_font_conv）+ 图标资源
 - [ ] **M5**：全功能量化压测（每个里程碑过一遍 stress，出 stats.csv 曲线）
 - [ ] **M6（等板子）**：`hal_fbdev.c`/`hal_audio.c` + 交叉编译 + 思必驰/eXosip 实装
