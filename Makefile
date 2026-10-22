@@ -62,14 +62,4 @@ clean:
 	@$(DEV) clean
 
 help:
-	@echo "make            编译并运行"
-	@echo "make build      只编译"
-	@echo "make run        只运行"
-	@echo "make stats      指标采集（FPS/内存/循环耗时 + bin/stats.csv）"
-	@echo "make stress     压测（查泄漏与碎片）"
-	@echo "make mem64      64KB 内存池运行（模拟小内存设备）"
-	@echo "make mem SIZE=N 指定内存池大小运行（例：make mem SIZE=32768）"
-	@echo "make debug      开断言运行"
-	@echo "make longrun    30 分钟长稳"
-	@echo "make rebuild    全量重编"
-	@echo "make clean      清理构建目录"
+	@$(DEV) help

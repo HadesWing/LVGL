@@ -76,7 +76,7 @@ make run        # 只运行
 |---|---|---|
 | `make stats` | 每 5 秒打印 FPS / 内存 / 主循环耗时，明细写 `bin/stats.csv` | 性能量化 |
 | `make stress` | 每 200ms 建删 8 个控件 + 切主题 + 触发来电，查**内存泄漏与碎片** | 稳定性自证 |
-| `make mem64` | 用 64KB 内存池重编再跑（模拟 RK3308 这类小内存设备） | 内存预算 |
+| `make mem64` | 用 64KB 内存池重编再跑（模拟 RK3308 这类小内存设备），产出独立的 `bin/main64.exe` | 内存预算 |
 | `make debug` | 打开 LVGL 断言（越界、野指针、样式/对象一致性） | 查 bug |
 | `make longrun` | 30 分钟长稳，到点自动打印汇总并退出 | 长稳 |
 | `make rebuild` / `make clean` | 全量重编 / 删构建目录 | |

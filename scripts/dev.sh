@@ -85,11 +85,11 @@ case "$CMD" in
         cd bin && LVGL_STRESS=1 LVGL_STATS=1 LVGL_RUN_SEC="${LVGL_RUN_SEC:-0}" exec "./$EXE_NAME"
         ;;
     mem64)
-        # 独立构建目录：换 LV_MEM_SIZE 会触发 lvgl 全量重编，不能污染默认构建
+        # 独立构建目录 + 独立输出名：换 LV_MEM_SIZE 会触发 lvgl 全量重编，
+        # 而且不能覆盖掉默认构建的 bin/main.exe
         BUILD_DIR=build-64k
-        configure -DLV_MEM_SIZE=65536
+        configure -DLV_MEM_SIZE=65536 -DMAIN_EXE_NAME=main64
         compile
-        cp -f "bin/$EXE_NAME" "bin/$EXE_64"
         echo "✅ 64KB 内存池版本：bin/$EXE_64"
         cd bin && LVGL_STATS=1 LVGL_RUN_SEC="${LVGL_RUN_SEC:-0}" exec "./$EXE_64"
         ;;
@@ -97,17 +97,15 @@ case "$CMD" in
         # 任意内存池大小：make mem SIZE=32768
         SIZE="${1:-65536}"
         BUILD_DIR="build-mem$SIZE"
-        configure -DLV_MEM_SIZE="$SIZE"
+        configure -DLV_MEM_SIZE="$SIZE" -DMAIN_EXE_NAME=main64
         compile
-        cp -f "bin/$EXE_NAME" "bin/$EXE_64"
         echo "✅ ${SIZE}B 内存池版本：bin/$EXE_64"
         cd bin && LVGL_STATS=1 LVGL_RUN_SEC="${LVGL_RUN_SEC:-0}" exec "./$EXE_64"
         ;;
     debug)
         BUILD_DIR=build-debug
-        configure -DLV_DEBUG_ASSERT=1
+        configure -DLV_DEBUG_ASSERT=1 -DMAIN_EXE_NAME=main-dbg
         compile
-        cp -f "bin/$EXE_NAME" "bin/$EXE_DBG"
         echo "✅ 断言版本：bin/$EXE_DBG"
         cd bin && LVGL_RUN_SEC="${LVGL_RUN_SEC:-0}" exec "./$EXE_DBG"
         ;;
@@ -119,6 +117,28 @@ case "$CMD" in
         cmake -E rm -rf build build-64k build-debug
         rm -rf build-mem* 2>/dev/null || true
         echo "build/ build-64k/ build-debug/ build-mem*/ 已删除"
+        ;;
+    help)
+        cat <<'EOF'
+make              编译 + 运行（最常用）
+make build        只编译
+make run          只运行
+make stats        指标采集：每 5 秒打印 FPS/内存/循环耗时，明细写 bin/stats.csv
+make stress       压测：每 200ms 建删 8 个控件，查内存泄漏与碎片
+make mem64        64KB 内存池运行（模拟小内存设备）
+make mem SIZE=N   指定内存池大小（例：make mem SIZE=40960）
+make debug        开 LVGL 断言运行（查越界/野指针，性能会掉）
+make longrun      30 分钟长稳，到点打印汇总并退出
+make rebuild      全量重编（= clean + build）
+make clean        删除所有构建目录
+
+环境变量：
+  LVGL_STATS=1      写 bin/stats.csv 并打印采样
+  LVGL_RUN_SEC=N    跑 N 秒后自动退出并打印汇总
+  LVGL_STRESS=1     压测模式（同 make stress）
+  LVGL_MOCK=0       关闭设备事件模拟
+  JOBS=N            编译并发度（默认 4，MSYS2 下别超过 6）
+EOF
         ;;
     *)
         echo "未知目标: $CMD"; exit 1

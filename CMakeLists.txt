@@ -183,6 +183,13 @@ endif()
 
 add_executable(main ${MAIN_SOURCES})
 
+# 可执行文件名可覆盖：不同内存池/断言版本各出自己的文件，避免互相覆盖 bin/main.exe
+#   例：-DMAIN_EXE_NAME=main64 → bin/main64.exe
+set(MAIN_EXE_NAME "main" CACHE STRING "Output executable name (variants: main64, main-dbg, ...)")
+if(NOT MAIN_EXE_NAME STREQUAL "main")
+    set_target_properties(main PROPERTIES OUTPUT_NAME "${MAIN_EXE_NAME}")
+endif()
+
 # 分层头文件路径：ui / app / hal 各自 include 时不用写相对路径
 target_include_directories(main PRIVATE
     ${PROJECT_SOURCE_DIR}/src
