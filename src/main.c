@@ -25,6 +25,7 @@
 #include <SDL.h>
 
 #include "hal/hal.h"
+#include "ui/ui_indoor.h"
 
 /*********************
  *      DEFINES
@@ -69,7 +70,8 @@ int main(int argc, char **argv)
   /* - lv_demo_stress(); */
   /* - lv_example_label_1(); */
   /* - etc. */
-  lv_demo_widgets();
+  /* lv_demo_widgets();            ← 官方 demo（学习对照用） */
+  ui_indoor_init();               /* ← 自研界面：室内机主界面 */
 
   while(1) {
     /* Periodically call the lv_task handler.
