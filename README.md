@@ -14,10 +14,12 @@
 
 | 目录 | 内容 |
 |---|---|
-| `src/` | 工程源码：`main.c`（LVGL 启动骨架）、`hal/hal.c`（显示 + 输入驱动层） |
+| `src/ui/` | **平台无关**界面层：`ui_theme.c`（命名样式 + 明暗主题）、`ui_indoor.c`（室内机主界面） |
+| `src/hal/` | **平台相关**驱动层：`hal_sdl.c`（Win/Linux 桌面）、`hal_fbdev.c`（Linux 真机，P1 待实现） |
+| `src/main.c` | 应用入口 + 心跳循环（`lv_init` → `hal_init` → `ui_init` → `lv_timer_handler`） |
 | `lv_conf.h` | **LVGL 配置总开关**（本仓库已修正矢量图相关宏，见"踩坑记录"第 4 条） |
 | `CMakeLists.txt` | 构建脚本（lvgl 作为子模块引入） |
-| `docs/` | 《LVGL环境搭建_从零到跑通.md》—— 完整教程 + 实战记录 |
+| `docs/` | 《LVGL环境搭建_从零到跑通.md》教程 + 《本地部署流程.md》 + 《跨平台移植说明.md》 |
 | `scripts/` | 一键环境搭建脚本（Windows + MSYS2） |
 | `lvgl/` | 上游 LVGL 库（**git submodule，不纳入本仓库**，首次使用需拉取） |
 
@@ -40,6 +42,7 @@ git submodule update --init --recursive lvgl
 
 # 2. 构建（在 MSYS2 MINGW64 终端中执行）
 mkdir -p build && cd build
+# -DLVGL_HAL=sdl（默认，Win/Linux 桌面）或 -DLVGL_HAL=fbdev（Linux 真机）
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
 ninja
 
@@ -90,7 +93,12 @@ while (1) {             // 4. 心跳循环：协作式单线程调度器
 ## 学习路线
 
 - [x] **Day 1**：环境搭建、编译、跑通官方 demo（Widgets）
-- [ ] **Day 2**：跑通 `lvgl/examples/widgets/` 各控件示例，掌握八组 API —— 对象/布局、样式与状态、事件、动画、定时器
+- [x] **Day 2-a**：样式系统（命名样式 / 状态样式 / 明暗主题热切换 / 换样式表达状态）
+- [ ] **Day 2-b**：flex / grid 布局（去掉绝对坐标）
+- [ ] **Day 2-c**：多页面 + 页面栈 + 转场动画
+- [ ] **Day 2-d**：中文点阵字体（lv_font_conv）+ 图标资源
+- [ ] **Day 2-e**：内存与渲染量化（lv_mem_monitor / FPS / draw buffer 对比）
+- [ ] **Day 2-f**：动画进阶（timeline 串联、透明度/缩放）
 - [ ] **Day 3**：做"室内机主界面"demo —— 状态栏 + 呼叫弹窗 + 接听/挂断按钮 + 视频占位区，加入场动画
 
 ## 参考

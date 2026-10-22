@@ -69,7 +69,29 @@ add_compile_definitions($<$<BOOL:${LV_USE_FFMPEG}>:LV_USE_FFMPEG=1>)
 add_subdirectory(lvgl)
 target_include_directories(lvgl PUBLIC ${PROJECT_SOURCE_DIR} ${SDL2_INCLUDE_DIRS})
 
-set(MAIN_SOURCES src/mouse_cursor_icon.c src/hal/hal.c src/ui/ui_indoor.c)
+# ---------------------------------------------------------------------------
+# HAL 后端选择（一份 UI 代码，多平台）
+#   -DLVGL_HAL=sdl      Windows / Linux 桌面模拟（默认，SDL2）
+#   -DLVGL_HAL=fbdev    Linux 真机（/dev/fb0 + evdev，仅 Linux 可用，待实现）
+# ---------------------------------------------------------------------------
+set(LVGL_HAL "sdl" CACHE STRING "HAL backend: sdl | fbdev")
+
+set(MAIN_SOURCES src/mouse_cursor_icon.c src/ui/ui_theme.c src/ui/ui_indoor.c)
+
+if(LVGL_HAL STREQUAL "fbdev")
+    if(WIN32)
+        message(FATAL_ERROR "LVGL_HAL=fbdev 只能在 Linux 上使用；Windows 请用 sdl")
+    endif()
+    if(NOT EXISTS ${PROJECT_SOURCE_DIR}/src/hal/hal_fbdev.c)
+        message(FATAL_ERROR "src/hal/hal_fbdev.c 尚未实现（P1 任务：fbdev + evdev HAL）")
+    endif()
+    list(APPEND MAIN_SOURCES src/hal/hal_fbdev.c)
+    message(STATUS "HAL backend: fbdev (Linux 真机)")
+else()
+    list(APPEND MAIN_SOURCES src/hal/hal_sdl.c)
+    message(STATUS "HAL backend: SDL2 (桌面模拟)")
+endif()
+
 set(MAIN_LIBS lvgl lvgl::examples lvgl::demos lvgl::thorvg ${SDL2_LIBRARIES})
 
 # Create the main executable, depending on the FreeRTOS option
