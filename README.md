@@ -3,6 +3,13 @@
 > 从零搭建 LVGL 开发环境 → 跑通 PC 模拟器 → 做出带屏设备界面 demo 的完整记录。
 > 目标场景：嵌入式 Linux（RK3308 / 智能家居中控屏 / 可视对讲室内机）上的 LVGL 应用开发。
 
+**仓库地址**：https://github.com/HadesWing/LVGL
+
+> 本机推送说明：受网络代理影响，HTTPS 推送到 github.com 会失败（`CONNECT tunnel failed, 502`）。
+> 本机已把远端配成 SSH（`git@github.com:HadesWing/LVGL.git`），并设置了全局改写规则
+> `url.git@github.com:.insteadOf = https://github.com/`，以后 `git push` 会自动走 SSH。
+> 前提：`~/.ssh/id_rsa` 已加入 GitHub 账号（本机已验证 `ssh -T git@github.com` 通过）。
+
 ## 这是什么
 
 | 目录 | 内容 |
