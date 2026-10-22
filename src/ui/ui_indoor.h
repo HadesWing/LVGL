@@ -26,4 +26,10 @@
 
 void ui_indoor_init(void);
 
+/* 模拟门口机来电（供设备模拟层 / 调试按钮调用，不依赖真实硬件） */
+void ui_indoor_simulate_call(void);
+
+/* 更新状态行文字（语音指令、门锁状态等业务事件回显） */
+void ui_indoor_set_status_text(const char *txt);
+
 #endif

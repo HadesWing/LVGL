@@ -1,0 +1,75 @@
+# =============================================================================
+# LVGL 室内机 demo —— 一键编译 / 运行 / 压测
+#
+#   make            编译并运行（最常用）
+#   make build      只编译
+#   make run        只运行
+#   make stats      带指标运行（每 5 秒打印 FPS/内存/循环耗时，明细写 bin/stats.csv）
+#   make stress     压测（控件反复建删 + 切主题，查泄漏与碎片）
+#   make mem64      64KB 内存池编译运行（模拟小内存设备）
+#   make mem SIZE=32768   任意内存池大小（找崩溃边界用）
+#   make debug      开 LVGL 断言运行（查越界/野指针，性能会下降）
+#   make longrun    30 分钟长稳（到点打印汇总并退出）
+#   make rebuild    全量重编
+#   make clean      删构建目录
+#   make help       显示帮助
+#
+# 说明：真正干活的是 scripts/dev.sh（在 MSYS2 环境里跑）。
+#       原因：make 直接调 cmake 时子进程 PATH 不完整，gcc 会静默失败。
+# =============================================================================
+
+ifeq ($(OS),Windows_NT)
+  BASH := C:/msys64/usr/bin/bash.exe
+else
+  BASH := bash
+endif
+
+DEV := $(BASH) scripts/dev.sh
+
+.PHONY: all build run rebuild stats stress mem64 mem debug longrun clean help
+
+all: build run
+
+build:
+	@$(DEV) build
+
+run:
+	@$(DEV) run
+
+rebuild:
+	@$(DEV) clean
+	@$(DEV) build
+
+stats:
+	@$(DEV) stats
+
+stress:
+	@$(DEV) stress
+
+mem64:
+	@$(DEV) mem64
+
+mem:
+	@$(DEV) mem $(SIZE)
+
+debug:
+	@$(DEV) debug
+
+longrun:
+	@$(DEV) longrun
+
+clean:
+	@$(DEV) clean
+
+help:
+	@echo "make            编译并运行"
+	@echo "make build      只编译"
+	@echo "make run        只运行"
+	@echo "make stats      指标采集（FPS/内存/循环耗时 + bin/stats.csv）"
+	@echo "make stress     压测（查泄漏与碎片）"
+	@echo "make mem64      64KB 内存池运行（模拟小内存设备）"
+	@echo "make mem SIZE=N 指定内存池大小运行（例：make mem SIZE=32768）"
+	@echo "make debug      开断言运行"
+	@echo "make longrun    30 分钟长稳"
+	@echo "make rebuild    全量重编"
+	@echo "make clean      清理构建目录"

@@ -65,6 +65,20 @@ add_compile_definitions($<$<BOOL:${LV_USE_LIBPNG}>:LV_USE_LIBPNG=1>)
 add_compile_definitions($<$<BOOL:${LV_USE_LIBJPEG_TURBO}>:LV_USE_LIBJPEG_TURBO=1>)
 add_compile_definitions($<$<BOOL:${LV_USE_FFMPEG}>:LV_USE_FFMPEG=1>)
 
+# ---------------------------------------------------------------------------
+# 内存 / 调试参数（作用于 lvgl 库与 app，必须在 add_subdirectory(lvgl) 之前）
+#   -DLV_MEM_SIZE=65536      LVGL 内存池大小（模拟 RK3308 这类小内存设备，默认 1MB）
+#   -DLV_DEBUG_ASSERT=1      打开 LVGL 断言（找 bug 用；性能测试时必须关）
+# ---------------------------------------------------------------------------
+if(LV_MEM_SIZE)
+    add_compile_definitions(LV_MEM_SIZE=${LV_MEM_SIZE})
+    message(STATUS "LV_MEM_SIZE = ${LV_MEM_SIZE} bytes")
+endif()
+if(LV_DEBUG_ASSERT)
+    add_compile_definitions(LV_DEBUG_ASSERT=1)
+    message(STATUS "LVGL assertions: ON (性能会明显下降)")
+endif()
+
 # Add LVGL subdirectory
 add_subdirectory(lvgl)
 target_include_directories(lvgl PUBLIC ${PROJECT_SOURCE_DIR} ${SDL2_INCLUDE_DIRS})
@@ -76,7 +90,11 @@ target_include_directories(lvgl PUBLIC ${PROJECT_SOURCE_DIR} ${SDL2_INCLUDE_DIRS
 # ---------------------------------------------------------------------------
 set(LVGL_HAL "sdl" CACHE STRING "HAL backend: sdl | fbdev")
 
-set(MAIN_SOURCES src/mouse_cursor_icon.c src/ui/ui_theme.c src/ui/ui_indoor.c)
+set(MAIN_SOURCES src/mouse_cursor_icon.c
+                 src/ui/ui_theme.c
+                 src/ui/ui_indoor.c
+                 src/app/app_stats.c
+                 src/app/app_mock.c)
 
 if(LVGL_HAL STREQUAL "fbdev")
     if(WIN32)
@@ -164,6 +182,13 @@ if(LVGL_PRO_PROJECT_DIR)
 endif()
 
 add_executable(main ${MAIN_SOURCES})
+
+# 分层头文件路径：ui / app / hal 各自 include 时不用写相对路径
+target_include_directories(main PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/ui
+    ${PROJECT_SOURCE_DIR}/src/app
+    ${PROJECT_SOURCE_DIR}/src/hal)
 target_compile_definitions(main PRIVATE LV_CONF_INCLUDE_SIMPLE)
 target_link_libraries(main ${MAIN_LIBS})
 

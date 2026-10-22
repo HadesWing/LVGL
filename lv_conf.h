@@ -55,7 +55,9 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
 /** Size of the pool `lv_malloc()` allocates from. Needs to be at least 2kB (2048). */
+#ifndef LV_MEM_SIZE
 #define LV_MEM_SIZE (1024 * 1024)
+#endif
 
 /** Place the pool at a fixed address instead of allocating it as a normal array.
  *  0: unused.
@@ -2092,7 +2094,7 @@
 #define LV_SYSMON_PROC_IDLE_AVAILABLE 0
 
 /** Show the CPU usage and FPS count in a label on the screen. */
-#define LV_USE_PERF_MONITOR 0
+#define LV_USE_PERF_MONITOR 1
 
 #if LV_USE_PERF_MONITOR
 /** Performance monitor position
@@ -2116,7 +2118,7 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
 /** Show the used memory and the memory fragmentation in a label on the screen. */
-#define LV_USE_MEM_MONITOR 0
+#define LV_USE_MEM_MONITOR 1
 
 #endif /*LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN*/
 
@@ -2366,14 +2368,19 @@
 /** LV_ASSERT_NULL */
 #define LV_USE_ASSERT_NULL 0
 
+/** 调试断言总开关：CMake -DLV_DEBUG_ASSERT=1 打开（会显著拖慢渲染，性能测试时必须关） */
+#ifndef LV_DEBUG_ASSERT
+#define LV_DEBUG_ASSERT 0
+#endif
+
 /** LV_ASSERT_STYLE */
-#define LV_USE_ASSERT_STYLE 1
+#define LV_USE_ASSERT_STYLE LV_DEBUG_ASSERT
 
 /** LV_ASSERT_MEM_INTEGRITY */
-#define LV_USE_ASSERT_MEM_INTEGRITY 1
+#define LV_USE_ASSERT_MEM_INTEGRITY LV_DEBUG_ASSERT
 
 /** LV_ASSERT_OBJ */
-#define LV_USE_ASSERT_OBJ 1
+#define LV_USE_ASSERT_OBJ LV_DEBUG_ASSERT
 
 /** Disable warning saying `LV_ASSERT_HANDLER_INCLUDE` is deprecated.
  *  This setting allows you to keep using old LVGL versions which rely on

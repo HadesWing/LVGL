@@ -70,9 +70,9 @@ static void on_reject_clicked(lv_event_t *e)
 /*---------------------------------------------------------------------------
  * 来电弹窗：2 秒后滑入（动画只改 y，外观仍由样式决定）
  *---------------------------------------------------------------------------*/
-static void show_call_popup(lv_timer_t *t)
+void ui_indoor_simulate_call(void)
 {
-    (void)t;
+    if (!call_popup) return;                 /* 界面尚未创建 */
     lv_obj_set_hidden(call_popup, false);
 
     lv_anim_t a;
@@ -83,6 +83,18 @@ static void show_call_popup(lv_timer_t *t)
     lv_anim_set_duration(&a, 400);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_start(&a);
+}
+
+/* 首启 2 秒后自动来一次电，方便直接看到效果 */
+static void show_call_popup(lv_timer_t *t)
+{
+    (void)t;
+    ui_indoor_simulate_call();
+}
+
+void ui_indoor_set_status_text(const char *txt)
+{
+    if (call_state_label) lv_label_set_text(call_state_label, txt);
 }
 
 /*---------------------------------------------------------------------------
