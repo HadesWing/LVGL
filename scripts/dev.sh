@@ -7,7 +7,7 @@
 #   gcc 找不到自己的 cc1/as 会**静默失败**，只报 "compiler is not able to compile
 #   a simple test program"，不给任何原因）。这里统一在 MSYS2 环境里跑，稳定可复现。
 #
-# 用法：bash scripts/dev.sh <build|run|stats|stress|mem64|debug|longrun|clean>
+# 用法：bash scripts/dev.sh <build|run|stats|stress|mem64|debug|longrun|echo|probe|clean>
 # =============================================================================
 set -e
 
@@ -133,6 +133,15 @@ case "$CMD" in
         echo "✅ 应答器：$(pwd)/bin/sip_echo$SUFFIX"
         cd bin && exec "./sip_echo$SUFFIX" "$@"
         ;;
+    probe)
+        # 离线 H.264 解码探针（纯 C + libavcodec，不依赖 LVGL/SDL）：先把"解码"单独跑对、跑出数字
+        #   bash scripts/dev.sh probe /path/to/xxx.h264
+        #   bash scripts/dev.sh probe /path/to/xxx.h264 --rgb565 frame.raw
+        cmake -G Ninja -S tools/h264_probe -B build-h264 -DCMAKE_BUILD_TYPE=Release
+        ninja -C build-h264 -j "${JOBS:-4}"
+        echo "✅ 解码探针：$(pwd)/bin/h264_probe$SUFFIX"
+        cd bin && exec "./h264_probe$SUFFIX" "$@"
+        ;;
     clean)
         cmake -E rm -rf build build-64k build-debug
         rm -rf build-mem* 2>/dev/null || true
@@ -152,6 +161,11 @@ make longrun      30 分钟长稳，到点打印汇总并退出
 make echo         板端自测：内置 SIP 回声应答器（纯 C，无需 Python/PC）
 make rebuild      全量重编（= clean + build）
 make clean        删除所有构建目录
+
+带参数的 PC 工具（走 bash 直接调）：
+  bash scripts/dev.sh echo                     起 SIP 回声应答器
+  bash scripts/dev.sh probe <file.h264>        离线 H.264 解码探针：打印单帧耗时
+  bash scripts/dev.sh probe <file.h264> --rgb565 frame.raw   额外导出 RGB565 帧
 
 环境变量：
   LVGL_STATS=1      写 bin/stats.csv 并打印采样

@@ -241,6 +241,7 @@ make debug                  # 开断言跑，查越界/野指针
 | 18 | 手机 Linphone 一点呼叫就挂，日志里连 INVITE 都没走完 | SDP **answer 的 m-line 条数必须与 offer 一致**（RFC 3264 §6），不支持的类型用 `m=video 0` 拒绝。我们原来只回 `m=audio`，带视频 offer 的软电话判为 SDP 非法 | `build_sdp()` 末尾补 `m=video 0 RTP/AVP 0` + `a=inactive`；将来收视频改成 `recvonly` + 回显 offer 的 pt |
 | 19 | 不填 `SIP_SERVER` 的点对点模式下，双方都静音、信令却全对 | `detect_local_ip()` 原本朝服务器地址探测网卡，没服务器时探测失败 → `s_local_ip` 停在 `127.0.0.1` → SDP 里 `c=IN IP4 127.0.0.1` 发给对端，对端把音频**发给自己** | 无服务器时回退到 `8.8.8.8:53` 探测默认路由（UDP connect 不发包）；另加 `SIP_LOCAL_IP` 人工覆盖，**板子多网卡必用** |
 | 20 | 手机开了 ICE 时，板子发出去的音频对方收不到 | offer 的 `c=` 行是 `0.0.0.0`，NAT 后端口也会变 | 对称 RTP（RFC 4961）：以**实收 RTP 包的源地址**校正回发目标，日志打 `[rtp] peer learned` |
+| 21 | 解码耗时测出来是 `0.00 ms`，比理论值低三个数量级 | FFmpeg 的 H.264 解码器在 `avcodec_send_packet()` 里真正做解码，`avcodec_receive_frame()` 只是从内部队列取帧（耗时≈0）。只给 receive 计时当然测不到 | 计时区间必须**包住 send + receive**，见 `tools/h264_probe` |
 
 > 第 6 条排查口诀：`ldd main.exe` 看依赖 → 程序目录优先于 PATH → 要么自带 DLL，要么静态链接（`-static`）。
 > 第 7、8 条是同一类问题：**Windows 上构建失败的根因经常不在代码，而在"谁替你启动了编译器"**。
@@ -332,6 +333,11 @@ SIP_TONE=1 make run                                                          # �
   - 测试方案已定：**手机装 Linphone 点对点直呼板子**，不架服务器，手机冒充门外机发声视频，
     板子 `recvonly` 只收不看。分 P0 语音 / P1 `ffplay` 验流 / P2 解码上屏三段。
     见 [`docs/音视频对讲测试方案.md`](docs/音视频对讲测试方案.md)
+  - 实现方案已定：音频 G.711 自研查表（无库）；视频 `libavcodec` 软解 / Rockchip MPP 硬解，
+    **层抽象成 `vdec` 双后端**，只用 libavcodec 不用 libavformat。见
+    [`docs/音视频编解码实现方案.md`](docs/音视频编解码实现方案.md)
+  - 工具已就位：`tools/h264_probe`（纯 C + libavcodec，解裸流、量单帧耗时、导 RGB565），
+    实测 480p 0.39ms/帧、720p 1.78ms/帧（PC 单线程），可交叉编译上板复核
 
 ## 参考
 
