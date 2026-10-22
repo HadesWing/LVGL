@@ -112,6 +112,7 @@ set(MAIN_SOURCES src/mouse_cursor_icon.c
                  src/app/app_stats.c
                  src/app/app_audio.c
                  src/app/g711.c
+                 src/app/wav.c
                  src/app/app_mock.c)
 
 if(LVGL_HAL STREQUAL "fbdev")
@@ -230,10 +231,36 @@ find_library(OSIPPARSER_LIB osipparser2 PATHS
 
 if(OSIP_INCLUDE_DIR AND OSIP_LIB AND OSIPPARSER_LIB)
     set(APP_WITH_SIP ON)
-    list(APPEND MAIN_SOURCES src/app/app_sip.c src/app/sip_md5.c)
+    list(APPEND MAIN_SOURCES src/app/app_sip.c src/app/sip_md5.c src/app/sdp.c)
     message(STATUS "SIP: enabled (libosip2 at ${OSIP_ROOT})")
 else()
     message(STATUS "SIP: disabled (libosip2 not found, see third_party/BUILD_OSIP.md)")
+endif()
+
+# ---------------------------------------------------------------------------
+# 视频解码（可选）
+#
+#   解包层（h264_depack）零依赖，总是编入 —— 它有单元测试，也是收视频的基础。
+#   解码层按"有没有 libavcodec"二选一：
+#     PC 有 ffmpeg     → vdec_ffmpeg.c（软解）
+#     没有 / 交叉编译  → vdec_stub.c  （vdec_open 返回 NULL，上层自动降级为
+#                                      "只收包不解码"，纯语音通话完全不受影响）
+#   板子 RK3308 接 MPP 硬解时，加一个 vdec_mpp.c 在这里登记即可，上层不动。
+# ---------------------------------------------------------------------------
+list(APPEND MAIN_SOURCES src/media/h264_depack.c src/app/app_video.c)
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(AVCODEC QUIET IMPORTED_TARGET libavcodec libavutil)
+endif()
+
+if(AVCODEC_FOUND)
+    list(APPEND MAIN_SOURCES src/media/vdec_ffmpeg.c)
+    list(APPEND MAIN_LIBS PkgConfig::AVCODEC)
+    message(STATUS "VDEC: libavcodec ${AVCODEC_VERSION}（软解）")
+else()
+    list(APPEND MAIN_SOURCES src/media/vdec_stub.c)
+    message(STATUS "VDEC: 无解码器（装 mingw-w64-x86_64-ffmpeg 后重配）")
 endif()
 
 add_executable(main ${MAIN_SOURCES})
@@ -250,6 +277,7 @@ target_include_directories(main PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/src/ui
     ${PROJECT_SOURCE_DIR}/src/app
+    ${PROJECT_SOURCE_DIR}/src/media
     ${PROJECT_SOURCE_DIR}/src/oem
     ${PROJECT_SOURCE_DIR}/src/hal)
 target_compile_definitions(main PRIVATE LV_CONF_INCLUDE_SIMPLE)

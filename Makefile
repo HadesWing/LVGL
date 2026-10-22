@@ -11,6 +11,8 @@
 #   make debug      开 LVGL 断言运行（查越界/野指针，性能会下降）
 #   make longrun    30 分钟长稳（到点打印汇总并退出）
 #   make duo        双端互通：本机起两个实例（室内机 + 客户端），双向音频各验一次
+#   make duo-video  视频接收链路：ffmpeg 推 RTP → 室内机解包/解码/落盘 → 与参考 YUV 比对
+#   make ut         自研代码单元测试（零依赖，PC 与板子同一份）
 #   make rebuild    全量重编
 #   make clean      删构建目录
 #   make help       显示帮助
@@ -27,7 +29,7 @@ endif
 
 DEV := $(BASH) scripts/dev.sh
 
-.PHONY: all build run rebuild stats stress mem64 mem debug longrun duo clean help
+.PHONY: all build run rebuild stats stress mem64 mem debug longrun duo duo-video ut clean help
 
 all: build run
 
@@ -61,6 +63,12 @@ longrun:
 
 duo:
 	@$(BASH) scripts/duo_test.sh $(SEC)
+
+duo-video:
+	@$(BASH) scripts/duo_video_test.sh $(SEC)
+
+ut:
+	@$(DEV) ut
 
 clean:
 	@$(DEV) clean

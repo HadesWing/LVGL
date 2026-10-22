@@ -29,6 +29,11 @@ DUR="${1:-12}"
 KEEP="${2:-}"
 
 cd "$BIN" || { echo "没有 bin/，先编译：make build"; exit 1; }
+# 主工程链接了 libavcodec 之后，运行时需要 MSYS2 的 dll 目录（dev.sh 里已处理，
+# 这里单独跑脚本时同样要加，否则报 "avutil-61.dll: cannot open shared object file"）
+if [ -d /c/msys64/mingw64/bin ]; then
+    export PATH="/c/msys64/mingw64/bin:$PATH"
+fi
 [ -f main.exe ] && EXE=main.exe || EXE=main
 [ -x "./$EXE" ] || { echo "找不到 ./$EXE，先执行 make build"; exit 1; }
 

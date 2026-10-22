@@ -161,7 +161,10 @@ static void apply_ini(void)
         return;
     }
 
-    char v[128];
+    /* 和 s_text_buf 同宽（96）。原来这里写 128，ini 里超过 95 字节的文案会被
+       snprintf 截断在目标缓冲里 —— 而中文是 3 字节/字，截在字中间就是半个字符，
+       LVGL 渲染出来是方框。宁可在读取端就限制长度，让超长的配置明确失效。 */
+    char v[sizeof(s_text_buf[0])];
 
     for (unsigned i = 0; i < sizeof(s_color_keys) / sizeof(s_color_keys[0]); i++) {
         if (ini_get(s_color_keys[i].key, v, sizeof(v)))
@@ -261,12 +264,12 @@ bool oem_select(const char *id)
 {
     const oem_profile_t *p = id ? profile_by_id(id) : NULL;
     if (!p) return false;
+
     s_cur = *p;
+    /* 不用在这里"恢复 ini 覆盖过的文案"：下面的 apply_ini() 会重新读 ini
+       并把命中项重新挂到 s_text_buf 上。曾经这里有个"清零后检查标志"的循环，
+       条件永远不成立，是纯死代码 —— 留着只会让后来的人以为流程有玄机。 */
     memset(s_text_overridden, 0, sizeof(s_text_overridden));
-    /* 覆盖文案要重新挂回常驻缓冲（否则指向旧 profile 的字面量） */
-    for (int i = 0; i < OEM_TXT_COUNT; i++) {
-        if (s_text_overridden[i]) s_cur.text[i] = s_text_buf[i];
-    }
     apply_ini();
     return true;
 }

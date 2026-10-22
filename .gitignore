@@ -29,6 +29,11 @@ bin/*.wav
 bin/*.alaw
 bin/*.raw
 
+# 自测产出的视频（素材与参考帧由 scripts/duo_video_test.sh 用 ffmpeg 生成，
+# 解码落盘的 .yuv 是调试残留，几百 MB，绝不入库）
+bin/*.yuv
+bin/*.h264
+
 # 编译中间文件
 *.obj
 *.o
@@ -37,3 +42,6 @@ bin/*.raw
 
 # 双端测试/自测日志（每次跑都会重生成，只在排查时看）
 bin/*.log
+
+# WorkBuddy 本地数据（工作记忆、自动化配置）
+.workbuddy/

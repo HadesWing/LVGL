@@ -12,6 +12,7 @@
  */
 #include "app_audio.h"
 #include "g711.h"
+#include "wav.h"
 
 #include <SDL.h>
 #include <stdio.h>
@@ -113,23 +114,14 @@ static int ring_count(ring_t *r)
 }
 
 /*---------------------------------------------------------------------------
- * WAV 读写（只支持 PCM 16bit；8k 单声道是目标格式）
+ * WAV 落盘（只支持 PCM 16bit；8k 单声道是目标格式）
+ *
+ * 头的生成与解析都搬到了 wav.c —— 那部分原先在这里是静态函数，
+ * 想单测就得把 SDL 拖进测试工程。现在只留两个字节序小工具给采样用。
  *---------------------------------------------------------------------------*/
-static void put_le32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-
 static void put_le16(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-}
-
-static uint32_t get_le32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 static uint16_t get_le16(const uint8_t *p)
@@ -137,31 +129,14 @@ static uint16_t get_le16(const uint8_t *p)
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-/* 44 字节标准头。data 大小未知时先写 0，落盘过程中反复回填 ——
-   这样即使进程被 kill，文件也是「能播到断开处」的合法 WAV。 */
-static void wav_header(uint8_t *h, uint32_t data_bytes)
-{
-    memcpy(h + 0,  "RIFF", 4);
-    put_le32(h + 4,  36 + data_bytes);
-    memcpy(h + 8,  "WAVE", 4);
-    memcpy(h + 12, "fmt ", 4);
-    put_le32(h + 16, 16);            /* fmt 块长度 */
-    put_le16(h + 20, 1);             /* PCM */
-    put_le16(h + 22, 1);             /* 单声道 */
-    put_le32(h + 24, RATE);
-    put_le32(h + 28, RATE * 2);      /* 字节率 */
-    put_le16(h + 32, 2);             /* 块对齐 */
-    put_le16(h + 34, 16);            /* 位深 */
-    memcpy(h + 36, "data", 4);
-    put_le32(h + 40, data_bytes);
-}
-
+/* 44 字节标准头由 wav.c 生成（那里有单测）。data 大小未知时先写 0，
+   落盘过程中反复回填 —— 这样即使进程被 kill，文件也是「能播到断开处」的合法 WAV。 */
 static void sink_wav_patch(void)
 {
     if (!s_sink_fp) return;
     long cur = ftell(s_sink_fp);
-    uint8_t h[44];
-    wav_header(h, s_sink_bytes);
+    uint8_t h[WAV_HEADER_BYTES];
+    wav_write_header(h, s_sink_bytes, 1, RATE);
     fseek(s_sink_fp, 0, SEEK_SET);
     fwrite(h, 1, sizeof(h), s_sink_fp);
     fseek(s_sink_fp, cur, SEEK_SET);
@@ -176,8 +151,8 @@ static bool sink_wav_open(const char *path)
         printf("[audio] 打不开落盘文件 %s（目录不存在？）\n", path);
         return false;
     }
-    uint8_t h[44];
-    wav_header(h, 0);
+    uint8_t h[WAV_HEADER_BYTES];
+    wav_write_header(h, 0, 1, RATE);
     fwrite(h, 1, sizeof(h), s_sink_fp);
     s_sink_bytes = 0;
     s_sink_patch = 0;
@@ -214,7 +189,8 @@ static void sink_wav_write(const int16_t *pcm, int n)
     }
 }
 
-/* 打开音源文件：识别 WAV（RIFF）或裸 PCM(8k mono s16) */
+/* 打开音源文件：识别 WAV（RIFF）或裸 PCM(8k mono s16)
+   WAV 头解析在 wav.c（有单测），这里只管文件句柄和业务语义 */
 static bool src_file_open(const char *path)
 {
     s_src_fp = fopen(path, "rb");
@@ -222,47 +198,23 @@ static bool src_file_open(const char *path)
         printf("[audio] 打不开音源文件 %s\n", path);
         return false;
     }
-    uint8_t hdr[12];
-    if (fread(hdr, 1, sizeof(hdr), s_src_fp) != sizeof(hdr) ||
-        memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
+
+    wav_info_t wi;
+    if (!wav_parse(s_src_fp, &wi)) {
         /* 当裸 PCM 处理：整文件就是采样 */
         fseek(s_src_fp, 0, SEEK_END);
         long sz = ftell(s_src_fp);
         fseek(s_src_fp, 0, SEEK_SET);
-        s_src_off = 0;
-        s_src_len = (uint32_t)(sz > 0 ? sz : 0);
-        s_src_ch  = 1;
+        s_src_off  = 0;
+        s_src_len  = (uint32_t)(sz > 0 ? sz : 0);
+        s_src_ch   = 1;
         s_src_rate = RATE;
         printf("[audio] 音源当裸 PCM 处理: %s (%u 字节)\n", path, s_src_len);
     } else {
-        s_src_ch = 1;
-        s_src_rate = RATE;
-        s_src_off = 0;
-        s_src_len = 0;
-        /* 逐块走：fmt / data */
-        for (;;) {
-            uint8_t ck[8];
-            if (fread(ck, 1, 8, s_src_fp) != 8) break;
-            uint32_t csz = get_le32(ck + 4);
-            if (memcmp(ck, "fmt ", 4) == 0) {
-                uint8_t f[16];
-                if (csz < 16 || fread(f, 1, 16, s_src_fp) != 16) break;
-                s_src_ch   = get_le16(f + 2);
-                s_src_rate = get_le32(f + 4);
-                if (csz > 16) fseek(s_src_fp, (long)(csz - 16), SEEK_CUR);
-            } else if (memcmp(ck, "data", 4) == 0) {
-                s_src_off = (uint32_t)ftell(s_src_fp);
-                s_src_len = csz;
-                break;
-            } else {
-                fseek(s_src_fp, (long)csz + (long)(csz & 1), SEEK_CUR);
-            }
-        }
-        if (s_src_len == 0) {
-            printf("[audio] %s 里找不到 data 块\n", path);
-            fclose(s_src_fp); s_src_fp = NULL;
-            return false;
-        }
+        s_src_ch   = wi.channels;
+        s_src_rate = wi.rate;
+        s_src_off  = wi.data_offset;
+        s_src_len  = wi.data_bytes;
         if (s_src_rate != RATE || s_src_ch > 2) {
             printf("[audio] 警告: 音源是 %u Hz / %d 声道，期望 %d Hz / 1 声道。"
                    "照 8k 直接送，音调会不对\n", s_src_rate, s_src_ch, RATE);

@@ -133,6 +133,15 @@ case "$CMD" in
         echo "✅ 应答器：$(pwd)/bin/sip_echo$SUFFIX"
         cd bin && exec "./sip_echo$SUFFIX" "$@"
         ;;
+    ut)
+        # 自研代码单元测试：独立工程（只测纯逻辑，不拉 LVGL/SDL/oSIP）
+        #   bash scripts/dev.sh ut          全部
+        #   bash scripts/dev.sh ut g711     只跑 suite 名含 g711 的
+        #   bash scripts/dev.sh ut -v       打印每个用例耗时
+        cmake -G Ninja -S tests -B build-ut -DCMAKE_BUILD_TYPE=Debug
+        ninja -C build-ut -j "${JOBS:-4}"
+        cd bin && exec "./ut$SUFFIX" "$@"
+        ;;
     probe)
         # 离线 H.264 解码探针（纯 C + libavcodec，不依赖 LVGL/SDL）：先把"解码"单独跑对、跑出数字
         #   bash scripts/dev.sh probe /path/to/xxx.h264
@@ -159,11 +168,16 @@ make mem SIZE=N   指定内存池大小（例：make mem SIZE=40960）
 make debug        开 LVGL 断言运行（查越界/野指针，性能会掉）
 make longrun      30 分钟长稳，到点打印汇总并退出
 make echo         板端自测：内置 SIP 回声应答器（纯 C，无需 Python/PC）
+make duo          双端互通：本机两个实例对打，双向音频各验一次
+make duo-video    视频接收链路：ffmpeg 推 RTP → 解包/解码/落盘 → 比对参考 YUV
+make ut           自研代码单元测试（62 个用例，零依赖）
 make rebuild      全量重编（= clean + build）
 make clean        删除所有构建目录
 
 带参数的 PC 工具（走 bash 直接调）：
   bash scripts/duo_test.sh [秒]               双端互通：本机两个实例（室内机+客户端）双向音频各验一次
+  bash scripts/duo_video_test.sh [秒]         视频接收链路：ffmpeg 推 RTP → 解包/解码/落盘 → 比对参考 YUV
+  bash scripts/dev.sh ut [过滤]               自研代码单元测试（零依赖；ut g711 只跑某组）
   bash scripts/dev.sh echo                     起 SIP 回声应答器
   bash scripts/dev.sh probe <file.h264>        离线 H.264 解码探针：打印单帧耗时
   bash scripts/dev.sh probe <file.h264> --rgb565 frame.raw   额外导出 RGB565 帧

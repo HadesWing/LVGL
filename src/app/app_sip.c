@@ -13,6 +13,8 @@
 #include "app_sip.h"
 #include "app_events.h"
 #include "app_audio.h"
+#include "app_video.h"
+#include "sdp.h"
 #include "g711.h"
 #include "sip_md5.h"
 
@@ -56,6 +58,7 @@ static osip_t    *s_osip = NULL;   /* 必须先 osip_init：它会调用 parser_
                                       pconfig[0].hname 为 NULL → strcmp 崩溃 */
 static sock_t     s_sock = SOCK_INVALID;
 static sock_t     s_rtp  = SOCK_INVALID;
+static sock_t     s_rtp_v = SOCK_INVALID;   /* 视频 RTP，独立端口（+2）独立 socket */
 static bool       s_running;
 static bool       s_registered;
 static volatile sip_state_t s_state = SIP_IDLE;
@@ -110,6 +113,11 @@ typedef struct {
     uint16_t    rtp_local;
     uint16_t    rtp_remote;
     uint8_t     payload;        /* 8=PCMA / 0=PCMU（按 SDP 协商结果） */
+    /* --- 视频（室内机目前只收不发） --- */
+    uint16_t    rtp_local_v;    /* 本地视频端口 = rtp_local + 2 */
+    uint16_t    rtp_remote_v;   /* 对端视频端口（从对端 SDP 的 m=video 取） */
+    uint8_t     video_pt;       /* 对端给 H.264 的动态负载类型，常见 96/102 —— 必须回显 */
+    bool        video_on;       /* 本次通话视频通道是否真的建立了 */
     char        remote_ip[64];
     uint64_t    t_answer_ms;
     uint64_t    t_start_ms;
@@ -130,6 +138,11 @@ static uint32_t s_rtp_ts;
 static uint32_t s_rtp_ssrc;
 static uint64_t s_next_frame_ms;  /* 下一帧的发送时刻（按墙上时钟补帧，防欠载） */
 static bool     s_rtp_echo;      /* 无声卡时（CI）用回声验证媒体通路 */
+
+/* --- 视频接收计数（和音频分开，便于区分"哪一路坏了"） --- */
+static uint32_t s_v_rx;          /* 收到的视频 RTP 包数 */
+static uint32_t s_v_pt_bad;      /* pt 不匹配被丢弃的包数 */
+static uint32_t s_v_last_ts;
 
 static void rtp_send_frame(void);
 
@@ -283,12 +296,19 @@ static void detect_local_ip(void)
 
 /*---------------------------------------------------------------------------
  * RTP：从 local_port+1000 起找偶数口（奇数口留给 RTCP，本实现不发）
+ *
+ * 视频用**相邻的偶数口**（audio_local + 2）单独开一个 socket。
+ * 为什么不共用一个 socket：
+ *   1) 视频包大（一个 I 帧分片上百分之一千个包），塞进音频那个 1600 字节
+ *      缓冲的接收循环里，会把音频的 20ms 节奏打乱；
+ *   2) 端口分开之后，抓包能一眼看出"音频通了视频没通"，排查少绕一圈；
+ *   3) 真实门口机/大华 VTH 的 SDP 里 m=audio 和 m=video 本来就是两个端口。
  *---------------------------------------------------------------------------*/
-static int rtp_open(void)
+static int rtp_open_video(void);
+
+static int rtp_bind_even(uint16_t from, uint16_t span, uint16_t *got, const char *tag)
 {
-    if (s_rtp != SOCK_INVALID) return 0;
-    for (uint16_t p = (uint16_t)(s_cfg.local_port + 1000);
-         p < (uint16_t)(s_cfg.local_port + 1100); p = (uint16_t)(p + 2)) {
+    for (uint16_t p = from; p < (uint16_t)(from + span); p = (uint16_t)(p + 2)) {
         sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd == SOCK_INVALID) return -1;
         struct sockaddr_in a;
@@ -297,21 +317,55 @@ static int rtp_open(void)
         a.sin_port = htons(p);
         a.sin_addr.s_addr = INADDR_ANY;
         if (bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0) {
-            s_rtp = fd;
-            s_call.rtp_local = p;
-            printf("[sip] RTP listening on udp/%u\n", p);
+            *got = p;
+            printf("[sip] %s RTP listening on udp/%u\n", tag, p);
             fflush(stdout);
-            return 0;
+            return (int)fd;
         }
         sock_close(fd);
     }
-    printf("[sip] RTP bind failed (%u..%u)\n", s_cfg.local_port + 1000, s_cfg.local_port + 1100);
+    printf("[sip] %s RTP bind failed (%u..%u)\n", tag, from, (unsigned)(from + span));
     return -1;
+}
+
+static int rtp_open(void)
+{
+    if (s_rtp != SOCK_INVALID) return 0;
+
+    int fd = rtp_bind_even((uint16_t)(s_cfg.local_port + 1000), 100,
+                           &s_call.rtp_local, "audio");
+    if (fd < 0) return -1;
+    s_rtp = (sock_t)fd;
+
+    rtp_open_video();
+    return 0;
+}
+
+/* 视频端口单独开：启动时（rtp_open）会先试一次，但那时 app_video 还没 open，
+   wants_rx() 为 false —— 真正打开是在 rtp_start_media 里 app_video_open() 之后
+   再调一次。合并成一个函数是为了这两处行为一致（端口号、失败降级、日志）。 */
+static int rtp_open_video(void)
+{
+    if (s_rtp_v != SOCK_INVALID) return 0;
+    if (!app_video_wants_rx()) return 0;
+    if (!s_call.rtp_local) return -1;      /* 音频没绑上，端口号无基准 */
+
+    int fdv = rtp_bind_even((uint16_t)(s_call.rtp_local + 2), 8,
+                            &s_call.rtp_local_v, "video");
+    if (fdv < 0) {
+        /* 打不开不算致命 —— 纯语音通话仍然可用，SDP 里会把 m=video 回成 0 */
+        s_call.rtp_local_v = 0;
+        return -1;
+    }
+    s_rtp_v = (sock_t)fdv;
+    return 0;
 }
 
 static void rtp_close(void)
 {
     if (s_rtp != SOCK_INVALID) { sock_close(s_rtp); s_rtp = SOCK_INVALID; }
+    if (s_rtp_v != SOCK_INVALID) { sock_close(s_rtp_v); s_rtp_v = SOCK_INVALID; }
+    s_call.rtp_local_v = 0;
 }
 
 /*---------------------------------------------------------------------------
@@ -322,7 +376,12 @@ static void rtp_close(void)
  *---------------------------------------------------------------------------*/
 static void rtp_start_media(void)
 {
+    /* 视频资源必须先开：端口要不要 bind 取决于视频路由（sink=drop 就不开）。
+       注意 rtp_open() 在启动时已经跑过一次，那时 app_video 还没 open，
+       这里的第二次调用才会真正绑上视频端口 —— 所以下面要再调一次。 */
+    app_video_open();
     rtp_open();
+    rtp_open_video();
     s_rtp_seq  = (uint16_t)(rand() & 0x7fff);
     s_rtp_ts   = (uint32_t)rand();
     s_rtp_ssrc = (uint32_t)rand();
@@ -344,6 +403,20 @@ static void rtp_start_media(void)
     printf("[rtp] media start: %s:%u pt=%u mode=%s\n",
            s_call.remote_ip, s_call.rtp_remote, s_call.payload,
            s_rtp_echo ? "echo(无可用音频)" : app_audio_route_desc());
+
+    /* 视频：只收不发。端口打不开或没编解码器时静默降级为纯语音，
+       不阻塞通话 —— 室内机上"能通话"优先于"有画面"。 */
+    s_call.video_on = false;
+    if (s_call.rtp_local_v && s_call.rtp_remote_v) {
+        s_call.video_on = true;
+        printf("[rtp] video: local udp/%u ← %s:%u pt=%u  %s\n",
+               (unsigned)s_call.rtp_local_v, s_call.remote_ip,
+               (unsigned)s_call.rtp_remote_v, (unsigned)s_call.video_pt,
+               app_video_route_desc());
+    } else {
+        printf("[rtp] video: 未建立（local_v=%u remote_v=%u）\n",
+               (unsigned)s_call.rtp_local_v, (unsigned)s_call.rtp_remote_v);
+    }
     fflush(stdout);
 }
 
@@ -357,69 +430,66 @@ static void rtp_print_stats(const char *why)
     double loss = expect ? 100.0 * (double)s_rtp_lost / (double)expect : 0.0;
     printf("[rtp] stats(%s) rx=%u tx=%u lost=%u ooo=%u loss=%.2f%% dur=%ds pps=%.1f\n",
            why, s_rtp_rx, s_rtp_tx, s_rtp_lost, s_rtp_ooo, loss, sec, pps);
+    /* 视频单独一行：混在音频里会让人误以为"pps 50 就是全部正常"，
+       而实际上视频可能一个包都没进来 */
+    if (s_call.video_on || s_v_rx || s_v_pt_bad)
+        printf("[rtp] video stats(%s) pkt=%u pt_bad=%u last_ts=%u\n",
+               why, s_v_rx, s_v_pt_bad, s_v_last_ts);
     fflush(stdout);
 }
 
 static void rtp_stop_media(void)
 {
+    app_video_stats_print("hangup");
+    app_video_close();
     app_audio_close();
     s_rtp_echo = false;
 }
 
 /*---------------------------------------------------------------------------
- * SDP：一路 PCMA/8000（与海思/大华门口机一致）+ 显式拒绝视频
+ * SDP：一路 PCMA/8000 + 一路 H.264 视频（只收不发）
  *
- * 为什么一定要写 m=video 这一行：
- * RFC 3264 §6 要求 answer 的 m-line **条数与顺序都与 offer 一致**，
- * 不支持的类型用 port=0 拒绝。手机上的 Linphone 默认带视频 offer，
- * 如果我们的 answer 里只有 m=audio，它判为 SDP 无效 → 通话直接失败，
- * 表现为"手机点呼叫就挂"。拒绝掉视频它才会降级成纯语音通话。
+ * m=video 这一行过去是写死 port=0 的（明确拒绝）。原因是 RFC 3264 §6 要求
+ * answer 的 m-line **条数与顺序都与 offer 一致**，不支持的类型用 port=0 拒绝。
+ * 手机上的 Linphone 默认带视频 offer，如果 answer 里只有 m=audio，它判为
+ * SDP 无效 → 通话直接失败，表现为"手机点呼叫就挂"。
  *
- * P1 要收视频时把最后两行换成：
- *   m=video <rtp_local+2> RTP/AVP <pt>   ← pt 必须用 offer 里给 H.264 的那个号
- *   a=rtpmap:<pt> H.264/90000
- *   a=recvonly                            ← 室内机只看不发，省掉编码器
+ * 现在真的收视频了：
+ *   - 有可用视频端口（rtp_local_v != 0）→ 回真实端口 + rtpmap + recvonly
+ *   - 否则回落到 port=0 的拒绝写法，纯语音通话不受影响
+ *
+ * 三个容易错的点：
+ *   1) **pt 必须回显 offer 里的号**。软电话给 H.264 常用 96，Linphone Android
+ *      常给 102；写死 96 会让对端按 96 发、我们按 102 认，包全丢。
+ *   2) recvonly 是刻意的：室内机只看不发，省掉编码器和一路 25fps 的 CPU。
+ *   3) profile-level-id 声明 42E01F（baseline 3.1）。声明得比实际能力低没关系，
+ *      声明高了会让对端发我们解不动的码流（比如 high profile 的 CABAC）。
  *---------------------------------------------------------------------------*/
 static int build_sdp(char *out, size_t sz)
 {
-    return snprintf(out, sz,
-        "v=0\r\n"
-        "o=- %u 1 IN IP4 %s\r\n"
-        "s=indoor-unit\r\n"
-        "c=IN IP4 %s\r\n"
-        "t=0 0\r\n"
-        "m=audio %u RTP/AVP 8\r\n"
-        "a=rtpmap:8 PCMA/8000\r\n"
-        "a=sendrecv\r\n"
-        "m=video 0 RTP/AVP 0\r\n"
-        "a=inactive\r\n",
-        (unsigned)rand(), s_local_ip, s_local_ip, s_call.rtp_local);
+    sdp_local_t L;
+    memset(&L, 0, sizeof(L));
+    L.local_ip   = s_local_ip;
+    L.audio_port = s_call.rtp_local;
+    L.video_port = s_call.rtp_local_v;      /* 0 = 拒绝视频 */
+    L.video_pt   = s_call.video_pt;         /* 0 时 sdp.c 用默认 96 */
+    return sdp_build(&L, out, sz);
 }
 
-/* 字段扫描取音频端口/IP/payload（避免引入 sdp_message 的额外解析层级） */
+/* 字段扫描取音频/视频端口、IP、payload（实现在 sdp.c，有单测） */
 static void parse_remote_sdp(const char *sdp, uint16_t *port, char *ip, size_t ipsz,
-                             uint8_t *payload)
+                             uint8_t *payload, uint16_t *vport, uint8_t *vpt)
 {
     if (!sdp) return;
-    const char *m = strstr(sdp, "m=audio ");
-    if (m && port) {
-        int p = atoi(m + 8);
-        if (p > 0) *port = (uint16_t)p;
-        /* m=audio 4000 RTP/AVP 8  → 取编码号，0=PCMU 8=PCMA */
-        const char *avp = strstr(m, "RTP/AVP ");
-        if (avp && payload) {
-            int pt = atoi(avp + 8);
-            if (pt == 0 || pt == 8) *payload = (uint8_t)pt;
-        }
-    }
-    const char *c = strstr(sdp, "c=IN IP4 ");
-    if (c && ip) {
-        const char *s = c + 9;
-        size_t i = 0;
-        while (*s && *s != '\r' && *s != '\n' && *s != '/' && i + 1 < ipsz)
-            ip[i++] = *s++;
-        ip[i] = '\0';
-    }
+
+    sdp_remote_t r;
+    sdp_parse_remote(sdp, &r);
+
+    if (port && r.audio_port) *port = r.audio_port;
+    if (payload)              *payload = r.audio_pt;
+    if (vport)                *vport = r.video_port;      /* 0 = 对端拒绝视频 */
+    if (vpt && r.video_pt)    *vpt = r.video_pt;
+    if (ip && r.ip[0])        safe_str(ip, ipsz, r.ip);
 }
 
 /*---------------------------------------------------------------------------
@@ -799,6 +869,12 @@ static void call_reset(void)
     s_call.outgoing = false;
     s_call.cancelled = false;
     s_call.t_answer_ms = 0;
+    /* 视频通道随通话一起复位。注意 rtp_local_v 不能清 —— 它是"这个进程
+       bind 到了哪个端口"，重新呼叫还要用同一个端口继续 bind 着。 */
+    s_call.video_on      = false;
+    s_call.rtp_remote_v  = 0;
+    s_v_rx = s_v_pt_bad = 0;
+    s_v_last_ts = 0;
 }
 
 static void idle_state(void)
@@ -812,11 +888,23 @@ int app_sip_call(const char *target)
     if (s_state == SIP_INCALL || s_state == SIP_RINGING || s_state == SIP_INCOMING) return -2;
 
     call_reset();
+    /* offer 里能不能带视频，取决于视频端口此刻有没有绑上。
+       所以这两步必须在 build_invite 之前 —— 放到"接通时"就晚了，
+       INVITE 已经带着 m=video 0 发出去了。 */
+    app_video_open();
+    rtp_open();
+    rtp_open_video();
+
     s_call.active = true;
     s_call.outgoing = true;
     s_call.cseq = 1;
     s_call.payload = 8;                  /* 默认 PCMA，最终以对端应答的 SDP 为准 */
     s_call.rtp_remote = 0;
+    /* 我们作为 offer 方时指定视频 pt=96（动态负载类型里最常见的一个）。
+       对端如果 answer 里换成别的号，parse_remote_sdp 会覆盖它 —— 
+       这也是"回显 offer 的 pt"这一步的由来。 */
+    s_call.video_pt = 96;
+    s_call.rtp_remote_v = 0;
     s_call.remote_ip[0] = '\0';
     s_call.t_start_ms = now_ms();
     snprintf(s_call.local_tag, sizeof(s_call.local_tag), "ind%u", (unsigned)(now_ms() & 0xffffff));
@@ -1054,7 +1142,8 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
         if (osip_message_get_body(msg, 0, &body) == 0 && body && body->body)
             parse_remote_sdp(body->body, &s_call.rtp_remote,
                              s_call.remote_ip, sizeof(s_call.remote_ip),
-                             &s_call.payload);
+                             &s_call.payload,
+                             &s_call.rtp_remote_v, &s_call.video_pt);
 
         /* 注意：2xx 的 ACK 必须用与 INVITE **相同**的 CSeq 号，不能自增，
            否则服务器/UAS 认为 ACK 匹配不上，会一直重传 200 OK（实测踩到） */
@@ -1158,11 +1247,15 @@ static void handle_request(osip_message_t *msg, struct sockaddr_in *from)
         if (osip_message_get_body(msg, 0, &body) == 0 && body && body->body)
             parse_remote_sdp(body->body, &s_call.rtp_remote,
                              s_call.remote_ip, sizeof(s_call.remote_ip),
-                             &s_call.payload);
+                             &s_call.payload,
+                             &s_call.rtp_remote_v, &s_call.video_pt);
         if (!s_call.remote_ip[0])
             safe_str(s_call.remote_ip, sizeof(s_call.remote_ip), inet_ntoa(from->sin_addr));
 
+        /* 应答里的 m=video 也得是真端口，所以视频资源在这里就要备好（不是等接通） */
+        app_video_open();
         rtp_open();
+        rtp_open_video();
         send_reply(&s_call.h, 100, "Trying", NULL, NULL);
         send_reply(&s_call.h, 180, "Ringing", NULL, NULL);
         set_state(SIP_INCOMING);
@@ -1316,6 +1409,51 @@ static void rtp_on_readable(void)
 }
 
 /*---------------------------------------------------------------------------
+ * 视频 RTP 收包
+ *
+ * 独立 socket、独立计数 —— "音频通了视频没通"这种问题，第一眼要看的就是
+ * 视频包有没有进来，而不是去翻解码日志。
+ *---------------------------------------------------------------------------*/
+static void rtp_video_on_readable(void)
+{
+    static uint8_t vbuf[2048];
+    struct sockaddr_in from;
+    int fromlen = sizeof(from);
+    int n = (int)recvfrom(s_rtp_v, (char *)vbuf, sizeof(vbuf), 0,
+                          (struct sockaddr *)&from, &fromlen);
+    if (n <= 12) return;
+
+    /* pt 校验：对端可能把音频也发到视频端口（SDP 写错、端口撞车、
+       或者路由器做了奇怪的端口映射）。pt 不匹配就丢 —— 把 G.711 当 H.264
+       送去解包，结果只会是"解包器把几十个字节全丢了"，但日志看着像丢包，
+       排查方向会跑偏。 */
+    uint8_t pt = vbuf[1] & 0x7F;
+    if (s_call.video_pt && pt != s_call.video_pt) {
+        s_v_pt_bad++;
+        return;
+    }
+
+    const uint8_t *payload = vbuf + 12;
+    int plen = n - 12;
+    if (vbuf[0] & 0x10) {
+        if (plen < 4) return;
+        int ext_words = (payload[2] << 8) | payload[3];
+        int skip = 4 + ext_words * 4;
+        if (skip >= plen) return;
+        payload += skip;
+        plen -= skip;
+    }
+    if (plen <= 0) return;
+
+    uint32_t ts = ((uint32_t)vbuf[4] << 24) | ((uint32_t)vbuf[5] << 16) |
+                  ((uint32_t)vbuf[6] << 8)  |  (uint32_t)vbuf[7];
+
+    s_v_rx++;
+    s_v_last_ts = ts;
+    app_video_on_rtp(payload, plen, ts);
+}
+
+/*---------------------------------------------------------------------------
  * RTP 媒体发：每 20ms 一帧 160 采样（G.711 固定 64kbps）
  *   节奏由 recv_loop 的 select 超时驱动（呼叫中 20ms 一次），
  *   没有麦克风数据时补静音 —— 保持稳定的包间隔，避免对端抖动缓冲"饿死"
@@ -1395,6 +1533,7 @@ static void *recv_loop(void *arg)
         FD_SET(s_sock, &rfds);
         sock_t maxfd = s_sock;
         if (s_rtp != SOCK_INVALID) { FD_SET(s_rtp, &rfds); if (s_rtp > maxfd) maxfd = s_rtp; }
+        if (s_rtp_v != SOCK_INVALID) { FD_SET(s_rtp_v, &rfds); if (s_rtp_v > maxfd) maxfd = s_rtp_v; }
 
         /* 呼叫中 20ms 一次（RTP 帧节奏），空闲时 100ms 足够 —— 既不空转 CPU，
            又能保证音频包间隔稳定（用 200ms 会在两帧之间攒出抖动） */
@@ -1449,6 +1588,7 @@ static void *recv_loop(void *arg)
         rtp_tx_tick();
 
         if (s_rtp != SOCK_INVALID && FD_ISSET(s_rtp, &rfds)) rtp_on_readable();
+        if (s_rtp_v != SOCK_INVALID && FD_ISSET(s_rtp_v, &rfds)) rtp_video_on_readable();
         if (!FD_ISSET(s_sock, &rfds)) continue;
 
         static char buf[4096];
