@@ -54,7 +54,7 @@ static void on_theme_clicked(lv_event_t *e)
 static void on_answer_clicked(lv_event_t *e)
 {
     (void)e;
-    lv_obj_add_flag(call_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(call_popup, true);
     lv_obj_add_style(video_area, &st_surface_calling, 0);   /* ← 换样式 */
     lv_label_set_text(video_hint, LV_SYMBOL_VIDEO "  Connected");
 }
@@ -62,7 +62,7 @@ static void on_answer_clicked(lv_event_t *e)
 static void on_reject_clicked(lv_event_t *e)
 {
     (void)e;
-    lv_obj_add_flag(call_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(call_popup, true);
     lv_obj_remove_style(video_area, &st_surface_calling, 0);/* ← 撤回样式 */
     lv_label_set_text(video_hint, LV_SYMBOL_VIDEO "  Door Camera");
 }
@@ -73,7 +73,7 @@ static void on_reject_clicked(lv_event_t *e)
 static void show_call_popup(lv_timer_t *t)
 {
     (void)t;
-    lv_obj_remove_flag(call_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(call_popup, false);
 
     lv_anim_t a;
     lv_anim_init(&a);
@@ -178,7 +178,7 @@ void ui_indoor_init(void)
     lv_obj_set_size(call_popup, 280, 150);
     lv_obj_set_pos(call_popup, 20, -150);
     lv_obj_add_style(call_popup, &st_card, 0);
-    lv_obj_add_flag(call_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(call_popup, true);
 
     lv_obj_t *caller = lv_label_create(call_popup);
     lv_obj_set_pos(caller, 0, 0);
