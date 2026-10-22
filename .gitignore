@@ -1,0 +1,22 @@
+# 构建产物
+build/
+bin/*.exe
+bin/*.dll
+bin/*.o
+
+# 上游子模块（用 git submodule update --init 拉取，不入库）
+/lvgl/
+/FreeRTOS/
+/lv_drivers/
+
+# IDE / 系统文件
+.vscode/
+*.code-workspace.user
+Thumbs.db
+desktop.ini
+
+# 编译中间文件
+*.obj
+*.o
+*.a
+*.exe
