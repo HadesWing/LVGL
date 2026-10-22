@@ -6,6 +6,9 @@ bin/*.dll
 bin/*.o
 bin/*.a
 bin/stats.csv
+logs/
+devices.ini
+third_party/osip-install/
 
 # 上游子模块（用 git submodule update --init 拉取，不入库）
 /lvgl/

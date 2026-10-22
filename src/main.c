@@ -34,6 +34,9 @@
 #include "app/app_devices.h"
 #include "app/app_stats.h"
 #include "app/app_mock.h"
+#ifdef APP_WITH_SIP
+#include "app/app_sip.h"
+#endif
 
 /*********************
  *      DEFINES
@@ -90,6 +93,13 @@ int main(int argc, char **argv)
   ui_home_init();                 /* ← M1：智能家居中控台主页 */
   app_stats_init();               /* ← 内存/帧率/循环耗时埋点 */
   app_mock_init();                /* ← 设备事件模拟（无板联调用） */
+
+#ifdef APP_WITH_SIP
+  /* SIP 未配置时保持 UI-only；设置了 SIP_SERVER 才真正注册 */
+  if(app_sip_init_from_env()) {
+    app_sip_start();
+  }
+#endif
 
   while(1) {
     /* 测一次 lv_timer_handler 的耗时：这是"渲染是否吃满 CPU"的直接证据 */

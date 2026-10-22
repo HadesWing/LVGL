@@ -92,8 +92,11 @@ set(LVGL_HAL "sdl" CACHE STRING "HAL backend: sdl | fbdev")
 
 set(MAIN_SOURCES src/mouse_cursor_icon.c
                  src/ui/ui_theme.c
-                 src/ui/ui_indoor.c
+                 src/ui/ui_common.c
+                 src/ui/ui_nav.c
                  src/ui/ui_home.c
+                 src/ui/ui_category.c
+                 src/ui/ui_device.c
                  src/app/app_events.c
                  src/app/app_devices.c
                  src/app/app_stats.c
@@ -184,6 +187,36 @@ if(LVGL_PRO_PROJECT_DIR)
   endif()
 endif()
 
+# ---------------------------------------------------------------------------
+# SIP 对讲（可选）：基于 libosip2
+#   -DOSIP_ROOT=<prefix>  指定 libosip2 安装前缀（默认 C:/osip_build/install）
+#   找不到就自动关闭，不影响 UI demo 编译（构建脚本见 third_party/BUILD_OSIP.md）
+# ---------------------------------------------------------------------------
+set(OSIP_ROOT "C:/osip_build/install" CACHE PATH "libosip2 install prefix")
+set(APP_WITH_SIP OFF)
+
+# 查找顺序：用户指定前缀 → third_party/osip-install（本机源码构建的产物目录）
+find_path(OSIP_INCLUDE_DIR osip2/osip.h PATHS
+    ${OSIP_ROOT}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/osip-install/include
+    NO_DEFAULT_PATH)
+find_library(OSIP_LIB osip2 PATHS
+    ${OSIP_ROOT}/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/osip-install/lib
+    NO_DEFAULT_PATH)
+find_library(OSIPPARSER_LIB osipparser2 PATHS
+    ${OSIP_ROOT}/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/osip-install/lib
+    NO_DEFAULT_PATH)
+
+if(OSIP_INCLUDE_DIR AND OSIP_LIB AND OSIPPARSER_LIB)
+    set(APP_WITH_SIP ON)
+    list(APPEND MAIN_SOURCES src/app/app_sip.c src/app/sip_md5.c)
+    message(STATUS "SIP: enabled (libosip2 at ${OSIP_ROOT})")
+else()
+    message(STATUS "SIP: disabled (libosip2 not found, see third_party/BUILD_OSIP.md)")
+endif()
+
 add_executable(main ${MAIN_SOURCES})
 
 # 可执行文件名可覆盖：不同内存池/断言版本各出自己的文件，避免互相覆盖 bin/main.exe
@@ -200,6 +233,14 @@ target_include_directories(main PRIVATE
     ${PROJECT_SOURCE_DIR}/src/app
     ${PROJECT_SOURCE_DIR}/src/hal)
 target_compile_definitions(main PRIVATE LV_CONF_INCLUDE_SIMPLE)
+if(APP_WITH_SIP)
+    target_compile_definitions(main PRIVATE APP_WITH_SIP=1)
+    target_include_directories(main PRIVATE ${OSIP_INCLUDE_DIR})
+    target_link_libraries(main ${OSIP_LIB} ${OSIPPARSER_LIB})
+    if(WIN32)
+        target_link_libraries(main ws2_32)
+    endif()
+endif()
 target_link_libraries(main ${MAIN_LIBS})
 
 # On Windows, GUI applications do not show a console by default,

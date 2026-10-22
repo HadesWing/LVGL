@@ -59,7 +59,11 @@ int          device_count(void);
 const device_t *device_get(int idx);
 int          device_find(const char *id);       /* 返回下标，-1 不存在 */
 const char  *device_type_icon(uint8_t type);    /* LVGL symbol */
+const char  *device_type_name(uint8_t type);    /* 分类显示名：灯光/窗帘/… */
 const char  *device_state_text(const device_t *d);  /* "已开启"/"26℃"/"80%"... */
+
+/* 该类型可调参数的取值范围；min==max 表示无可调参数（插座/摄像头） */
+void         device_value_range(uint8_t type, int16_t *min, int16_t *max);
 
 /* 统一动作入口：改状态 → 发 EV_DEVICE_CHANGED → 落盘。返回受影响设备数 */
 int          device_execute(const device_cmd_t *cmd);

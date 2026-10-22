@@ -103,6 +103,17 @@ bool app_events_subscribe(app_event_type_t type, app_event_cb_t cb, void *user_d
     return true;
 }
 
+void app_events_unsubscribe(app_event_type_t type, app_event_cb_t cb)
+{
+    int w = 0;
+    for (int r = 0; r < s_sub_count; r++) {
+        if (s_subs[r].type == type && s_subs[r].cb == cb) continue;   /* 丢弃 */
+        if (w != r) s_subs[w] = s_subs[r];
+        w++;
+    }
+    s_sub_count = w;
+}
+
 void app_events_post(app_event_type_t type, int32_t arg0, int32_t arg1, const void *ptr)
 {
     lock_take();

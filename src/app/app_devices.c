@@ -128,6 +128,33 @@ const char *device_type_icon(uint8_t type)
     }
 }
 
+const char *device_type_name(uint8_t type)
+{
+    switch ((device_type_t)type) {
+    case DEV_LIGHT:   return "灯光";
+    case DEV_CURTAIN: return "窗帘";
+    case DEV_AC:      return "空调";
+    case DEV_FRESH:   return "新风";
+    case DEV_PLUG:    return "插座";
+    case DEV_CAM:     return "摄像头";
+    default:          return "设备";
+    }
+}
+
+void device_value_range(uint8_t type, int16_t *min, int16_t *max)
+{
+    int16_t lo = 0, hi = 0;
+    switch ((device_type_t)type) {
+    case DEV_LIGHT:   lo = 1;  hi = 100; break;   /* 亮度 */
+    case DEV_CURTAIN: lo = 0;  hi = 100; break;   /* 开度 */
+    case DEV_AC:      lo = 16; hi = 30;  break;   /* 温度 */
+    case DEV_FRESH:   lo = 10; hi = 100; break;   /* 风量 */
+    default:          lo = 0;  hi = 0;   break;   /* 无参数 */
+    }
+    if (min) *min = lo;
+    if (max) *max = hi;
+}
+
 const char *device_state_text(const device_t *d)
 {
     static char buf[32];

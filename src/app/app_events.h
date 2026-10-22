@@ -44,6 +44,9 @@ void app_events_init(void);
 /* 订阅：回调一定在主线程（LVGL 线程）执行 */
 bool app_events_subscribe(app_event_type_t type, app_event_cb_t cb, void *user_data);
 
+/* 退订：页面销毁时必须调用，否则回调会打到已删除的控件上（野指针崩溃） */
+void app_events_unsubscribe(app_event_type_t type, app_event_cb_t cb);
+
 /* 发布：任意线程可调（内部加锁入队），主线程统一分发 */
 void app_events_post(app_event_type_t type, int32_t arg0, int32_t arg1, const void *ptr);
 
