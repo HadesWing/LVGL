@@ -8,6 +8,9 @@ bin/*.a
 bin/stats.csv
 logs/
 devices.ini
+# 现场配置含明文密码，只提交 config/sip.ini.example
+sip.ini
+bin/sip.ini
 third_party/osip-install/
 
 # 上游子模块（用 git submodule update --init 拉取，不入库）

@@ -61,6 +61,19 @@ static bool       s_registered;
 static volatile sip_state_t s_state = SIP_IDLE;
 static char       s_local_ip[64] = "127.0.0.1";
 static char       s_regid[96];     /* 注册用的 Call-ID */
+
+/* --- 配置缓冲（定义在文件前部：detect_local_ip 等函数先于 init 使用它们） ---
+   产品路径 = sip.ini → 静态缓冲；调试路径 = 环境变量覆盖。
+   不能直接存 getenv 的指针：ini 的行缓冲会被下一行覆盖。 */
+static char     s_cfg_server[80]  = "127.0.0.1";
+static char     s_cfg_user[40]    = "1001";
+static char     s_cfg_pass[80]    = "";
+static char     s_cfg_localip[64] = "";    /* 空 = 自动探测出口网卡 */
+static uint16_t s_cfg_sport       = 5060;
+static uint16_t s_cfg_lport       = 5062;
+static int      s_cfg_expires     = 3600;
+static bool     s_cfg_p2p;                 /* 点对点：不注册、无服务器 */
+static bool     s_cfg_has_server;          /* 配置里到底有没有给服务器 */
 static int        s_cseq = 1;
 
 /* --- Digest 认证状态（401 挑战 → 带 Authorization 重发 REGISTER） --- */
@@ -118,6 +131,27 @@ static void rtp_send_frame(int tone, const int16_t *sine8, int *phase);
 static int      s_expires = 3600;
 static uint64_t s_last_register_ms;
 static bool     s_reg_pending;   /* 有一个 REGISTER 事务在飞（区分注册响应/呼叫响应） */
+
+/* 注册的"可靠性"三件套：事务超时、指数退避、续期抖动。
+   没有这三样，网络闪断 30 秒后设备就永久掉线——而界面上还显示"已注册"，
+   这是对讲产品最典型的现场投诉。 */
+static uint64_t s_reg_sent_ms;        /* 本次 REGISTER 发出时刻 */
+static uint64_t s_reg_retry_at_ms;    /* 下次重试时刻，0 = 无待办 */
+static int      s_reg_backoff_s = 1;  /* 当前退避秒数：1,2,4,8...60 */
+static int      s_reg_refresh_pct = 50; /* 续期触发点（Expires 的百分比，50~80 随机） */
+static bool     s_reg_fatal;          /* 账号/密码/域类错误：重试没有意义 */
+static int      s_reg_cseq;           /* 本次注册事务的 CSeq（用于把呼出的响应区分开） */
+
+/* 注册与呼叫共用同一个 CSeq 计数器，而响应里只有 CSeq 能说明它属于哪个事务。
+   不比对 CSeq 的后果：续期窗口内正好有个呼叫被 486 拒了，会被当成"注册失败"，
+   接着把设备状态打到 SIP_REGISTERING —— 界面从"在线"跳成"未注册"。 */
+static bool is_reg_response(osip_message_t *msg)
+{
+    if (!s_reg_pending) return false;
+    if (s_reg_cseq <= 0) return true;                       /* 老路径兜底 */
+    if (!msg->cseq || !msg->cseq->number) return true;      /* 对端没回 CSeq：按注册处理 */
+    return atoi(msg->cseq->number) == s_reg_cseq;
+}
 
 static uint64_t now_ms(void)
 {
@@ -213,9 +247,9 @@ static void safe_str(char *dst, size_t dsz, const char *src)
  * 症状是"信令全对、两边都静音"，极难查。 */
 static void detect_local_ip(void)
 {
-    const char *fixed = getenv("SIP_LOCAL_IP");
-    if (fixed && *fixed) {
-        safe_str(s_local_ip, sizeof(s_local_ip), fixed);
+    /* 配置里写死优先（板子 eth0+wlan0 双网卡时必填，否则可能挑错出口） */
+    if (s_cfg_localip[0]) {
+        safe_str(s_local_ip, sizeof(s_local_ip), s_cfg_localip);
         return;
     }
 
@@ -675,6 +709,25 @@ static int build_auth_header(char *out, size_t outsz)
     return (n > 0 && (size_t)n < outsz) ? 0 : -1;
 }
 
+/* 注册事务失败 → 进入指数退避（1,2,4,...,60 秒）。
+   设计取舍：不无限快重试。SIP 服务器被大批设备同时重连打挂，比单台掉线严重得多。 */
+static void reg_fail(const char *why)
+{
+    s_reg_pending = false;
+    s_registered  = false;
+    if (s_reg_fatal) return;
+
+    if (s_reg_backoff_s < 1) s_reg_backoff_s = 1;
+    s_reg_retry_at_ms = now_ms() + (uint64_t)s_reg_backoff_s * 1000u;
+    printf("[sip] 注册未成功（%s），%d 秒后重试\n", why, s_reg_backoff_s);
+    fflush(stdout);
+    s_reg_backoff_s = (s_reg_backoff_s < 60) ? s_reg_backoff_s * 2 : 60;
+
+    /* 通话中不能改状态：通话优先级高于注册状态显示 */
+    if (s_state != SIP_INCALL && s_state != SIP_INCOMING && s_state != SIP_RINGING)
+        set_state(SIP_REGISTERING);
+}
+
 static void send_register(void)
 {
     osip_message_t *msg = NULL;
@@ -683,6 +736,8 @@ static void send_register(void)
         /* 续期（通话中）不能改状态，否则来电/通话中的界面会被打回"在线" */
         if (s_state == SIP_IDLE || s_state == SIP_ERROR) set_state(SIP_REGISTERING);
         s_reg_pending = true;
+        s_reg_sent_ms = now_ms();
+        s_reg_cseq    = s_cseq - 1;
         if (send_msg(msg) == 0) printf("[sip] REGISTER sent (cseq=%d)\n", s_cseq - 1);
         osip_message_free(msg);
     }
@@ -702,6 +757,8 @@ static void send_register_authed(void)
     if (msg) {
         if (s_state == SIP_IDLE || s_state == SIP_ERROR) set_state(SIP_REGISTERING);
         s_reg_pending = true;
+        s_reg_sent_ms = now_ms();
+        s_reg_cseq    = s_cseq - 1;
         if (send_msg(msg) == 0) printf("[sip] REGISTER(auth) sent\n");
         osip_message_free(msg);
     }
@@ -869,10 +926,16 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
     fflush(stdout);
 
     /* --- 注册 --- */
-    if (s_reg_pending && code == 200) {
+    if (is_reg_response(msg) && code == 200) {
         s_reg_pending = false;
         s_registered = true;
         s_last_register_ms = now_ms();
+        s_reg_backoff_s    = 1;
+        s_reg_retry_at_ms  = 0;
+        s_reg_fatal        = false;
+        /* 续期点随机化到 50%~80%：整批设备同一秒续期，会把服务器打出一个
+           周期性的尖峰（现场表现是"每小时整点全网卡一下"） */
+        s_reg_refresh_pct  = 50 + (int)(rand() % 31);
         /* 通话/来电/呼出中收到的是"续期"响应，不能把界面状态打回"在线" */
         if (s_state != SIP_INCALL && s_state != SIP_INCOMING && s_state != SIP_RINGING)
             set_state(SIP_ONLINE);
@@ -882,12 +945,16 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
         try_autocall_once();
         return;
     }
-    if (s_reg_pending && (code == 401 || code == 407)) {
+    if (is_reg_response(msg) && (code == 401 || code == 407)) {
         osip_www_authenticate_t *wa = NULL;
         osip_message_get_www_authenticate(msg, 0, &wa);
         if (!wa) osip_message_get_proxy_authenticate(msg, 0, &wa);
         if (!wa || s_auth_tried) {
-            printf("[sip] auth failed%s\n", s_auth_tried ? " (retry already sent)" : " (no challenge)");
+            printf("[sip] auth failed%s —— 密码错就是密码错，重试只会把账号锁掉\n",
+                   s_auth_tried ? "（带 Authorization 仍被拒）" : "（没拿到挑战头）");
+            fflush(stdout);
+            s_reg_pending = false;
+            s_reg_fatal   = true;          /* 停下来，等人改配置，不再自旋 */
             set_state(SIP_ERROR);
             return;
         }
@@ -899,6 +966,22 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
                s_realm, s_nonce, s_qop[0] ? s_qop : "-");
         fflush(stdout);
         send_register_authed();
+        return;
+    }
+
+    /* 注册的其它失败分支。分两类：配置问题停手，服务器问题退避重试 */
+    if (is_reg_response(msg) && code >= 300) {
+        if (code == 400 || code == 403 || code == 404 || code == 405) {
+            printf("[sip] 注册被拒（%d）：账号 / 密码 / 域 / 端口对不上，已停止重试\n", code);
+            fflush(stdout);
+            s_reg_pending = false;
+            s_reg_fatal   = true;
+            set_state(SIP_ERROR);
+            return;
+        }
+        char why[32];
+        snprintf(why, sizeof(why), "%d", code);
+        reg_fail(why);
         return;
     }
 
@@ -1271,9 +1354,23 @@ static void *recv_loop(void *arg)
                 fflush(stdout);
                 call_reset();
             }
-            /* 注册续期：Expires 一半时重发 REGISTER（真实服务器会踢掉过期账号） */
-            if (s_registered && s_expires > 0 &&
-                (now_ms() - s_last_register_ms) > (uint64_t)(s_expires / 2) * 1000u) {
+            /* ① 注册事务超时：32s ≈ RFC 3261 Timer F（UDP 非 INVITE 事务）的工程值。
+                  没有这一步，包丢了就永远是"注册中"，设备要靠重启恢复。 */
+            if (s_reg_pending && s_reg_sent_ms && (now_ms() - s_reg_sent_ms) > 32000u) {
+                reg_fail("事务超时");
+            }
+            /* ② 到点重试：网络恢复后自动回到在线，不需要人工干预 */
+            if (!s_registered && !s_reg_pending && !s_reg_fatal &&
+                s_reg_retry_at_ms && now_ms() >= s_reg_retry_at_ms) {
+                s_reg_retry_at_ms = 0;
+                s_auth_tried = 0;
+                send_register();
+            }
+            /* ③ 续期：Expires 的 50%~80%（每个周期现随机）。
+                  固定 50% 是不够的——几百台设备同时上线，续期会在同一秒撞在一起。 */
+            if (s_registered && !s_reg_pending && s_expires > 0 &&
+                (now_ms() - s_last_register_ms) >
+                    (uint64_t)((long long)s_expires * s_reg_refresh_pct / 100) * 1000u) {
                 s_auth_tried = 0;
                 send_register();
             }
@@ -1334,31 +1431,122 @@ static void *recv_loop(void *arg)
 /*---------------------------------------------------------------------------
  * 对外接口
  *---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------
+ * 配置：编译默认 → sip.ini → 环境变量（后者覆盖前者）
+ *
+ * 产品形态是"上电即用"：出厂把 sip.ini 烧进 /etc/indoor/，现场不需要任何
+ * 环境变量，也不该让安装工碰命令行。开发机上反过来——环境变量随手改，
+ * 方便换服务器、压测、做 CI。
+ *
+ * 字符串一律落在静态缓冲里：getenv 的返回值生命周期不由我们控制，
+ * ini 的行缓冲每轮就被覆盖，直接用指针存下来必然踩野指针。
+ *---------------------------------------------------------------------------*/
+
+static char *cfg_trim(char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+    return s;
+}
+
+static void cfg_copy(char *dst, size_t dsz, const char *v)
+{
+    if (!v) return;
+    snprintf(dst, dsz, "%s", v);
+}
+
+/* 极简 ini 解析：`key = value`，`#`/`;` 起头为注释，`[section]` 直接跳过。
+   刻意不引第三方解析库——语法就这么几行，多一个依赖不值得。 */
+static bool cfg_load_ini(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+
+    char line[256];
+    int  used = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = cfg_trim(line);
+        if (!*p || *p == '#' || *p == ';' || *p == '[') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *k = cfg_trim(p);
+        char *v = cfg_trim(eq + 1);
+        /* 行内注释：` ; ...` / ` # ...`（前面必须有空白，否则会把密码里的符号切掉） */
+        for (char *c = v; *c; c++) {
+            if ((*c == ';' || *c == '#') && (c == v || c[-1] == ' ' || c[-1] == '\t')) {
+                *c = 0;
+                break;
+            }
+        }
+        v = cfg_trim(v);
+        size_t vl = strlen(v);
+        if (vl >= 2 && (v[0] == '"' || v[0] == '\'') && v[vl - 1] == v[0]) { v[vl - 1] = 0; v++; }
+
+        if      (!strcmp(k, "server"))      { cfg_copy(s_cfg_server, sizeof(s_cfg_server), v);
+                                              s_cfg_has_server = (*v != 0); }
+        else if (!strcmp(k, "port"))        s_cfg_sport      = (uint16_t)atoi(v);
+        else if (!strcmp(k, "user"))        cfg_copy(s_cfg_user, sizeof(s_cfg_user), v);
+        else if (!strcmp(k, "password"))    cfg_copy(s_cfg_pass, sizeof(s_cfg_pass), v);
+        else if (!strcmp(k, "local_port"))  s_cfg_lport      = (uint16_t)atoi(v);
+        else if (!strcmp(k, "local_ip"))    cfg_copy(s_cfg_localip, sizeof(s_cfg_localip), v);
+        else if (!strcmp(k, "expires"))     s_cfg_expires    = atoi(v);
+        else if (!strcmp(k, "no_register")) s_cfg_p2p        = (atoi(v) != 0 || !strcmp(v, "true"));
+        else continue;                          /* 未知键忽略：向前兼容旧/新配置 */
+        used++;
+    }
+    fclose(f);
+    printf("[sip] ini %s: %d 项\n", path, used);
+    return true;
+}
+
 bool app_sip_init_from_env(void)
 {
-    const char *server = getenv("SIP_SERVER");
-    /* 点对点模式（SIP_NO_REGISTER）不需要服务器：门口机与室内机直连、
-       或者拿 MicroSIP 直接打 IP 联调，都属于这种场景 */
-    bool p2p = getenv("SIP_NO_REGISTER") != NULL;
-    if ((!server || !*server) && !p2p) {
-        printf("[sip] SIP_SERVER not set -> SIP disabled (UI-only mode)\n");
+    /* ① 配置文件：SIP_INI 指定 > /etc/indoor/sip.ini（板子）> ./sip.ini（开发机） */
+    const char *ini = getenv("SIP_INI");
+    if (ini && *ini) {
+        if (!cfg_load_ini(ini)) printf("[sip] ini %s 打不开，改用默认值\n", ini);
+    } else if (!cfg_load_ini("/etc/indoor/sip.ini")) {
+        cfg_load_ini("sip.ini");
+    }
+
+    /* ② 环境变量覆盖（调试/压测/CI 用，优先级最高，语义与之前完全一致） */
+    const char *e;
+    if ((e = getenv("SIP_SERVER")) && *e)     { cfg_copy(s_cfg_server, sizeof(s_cfg_server), e);
+                                                s_cfg_has_server = true; }
+    if ((e = getenv("SIP_PORT")) && *e)       s_cfg_sport   = (uint16_t)atoi(e);
+    if ((e = getenv("SIP_USER")) && *e)       cfg_copy(s_cfg_user, sizeof(s_cfg_user), e);
+    if ((e = getenv("SIP_PASS")))             cfg_copy(s_cfg_pass, sizeof(s_cfg_pass), e);
+    if ((e = getenv("SIP_LOCAL_PORT")) && *e) s_cfg_lport   = (uint16_t)atoi(e);
+    if ((e = getenv("SIP_LOCAL_IP")) && *e)   cfg_copy(s_cfg_localip, sizeof(s_cfg_localip), e);
+    if ((e = getenv("SIP_EXPIRES")) && *e)    s_cfg_expires = atoi(e);
+    if (getenv("SIP_NO_REGISTER"))            s_cfg_p2p     = true;
+
+    s_cfg_expires = (s_cfg_expires < 60) ? 60 : s_cfg_expires;   /* 太快会被服务器当泛洪 */
+
+    /* ③ 判定是否启用：点对点模式（门口机直连 / MicroSIP 直呼）不需要服务器 */
+    if (!s_cfg_has_server && !s_cfg_p2p) {
+        printf("[sip] 未配置服务器 -> SIP 关闭（纯 UI 模式）\n");
+        printf("[sip] 要启用：写好 sip.ini，或设 SIP_SERVER=...（见 config/sip.ini.example）\n");
         return false;
     }
-    if (!server || !*server) server = "127.0.0.1";   /* p2p 时仅用于拼默认 URI */
-    s_cfg.server      = server;
-    s_cfg.server_port = (uint16_t)atoi(getenv("SIP_PORT") ? getenv("SIP_PORT") : "5060");
-    s_cfg.user        = getenv("SIP_USER") ? getenv("SIP_USER") : "1001";
-    s_cfg.pass        = getenv("SIP_PASS") ? getenv("SIP_PASS") : "";
-    s_cfg.local_port  = (uint16_t)atoi(getenv("SIP_LOCAL_PORT") ? getenv("SIP_LOCAL_PORT") : "5062");
-    s_expires         = getenv("SIP_EXPIRES") ? atoi(getenv("SIP_EXPIRES")) : 3600;
-    if (s_expires < 60) s_expires = 60;      /* 太快会被服务器当泛洪 */
+
+    s_cfg.server      = s_cfg_server;
+    s_cfg.server_port = s_cfg_sport;
+    s_cfg.user        = s_cfg_user;
+    s_cfg.pass        = s_cfg_pass;
+    s_cfg.local_port  = s_cfg_lport;
+
     /* 强迫回声模式（CI 无麦克风时用，验证媒体双向通路而不依赖声卡） */
     s_rtp_echo = getenv("SIP_RTP_ECHO") != NULL;
+
     srand((unsigned)time(NULL));
     snprintf(s_regid, sizeof(s_regid), "indoor-%08x-%u@%s",
              (unsigned)rand(), proc_id(), s_local_ip);
-    printf("[sip] cfg: %s:%u user=%s local=%u\n",
-           s_cfg.server, s_cfg.server_port, s_cfg.user, s_cfg.local_port);
+    printf("[sip] cfg: %s:%u user=%s local=%u expires=%d%s\n",
+           s_cfg.server, s_cfg.server_port, s_cfg.user, s_cfg.local_port, s_cfg_expires,
+           s_cfg_p2p ? " p2p" : "");
     return true;
 }
 

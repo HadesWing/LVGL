@@ -80,6 +80,10 @@ if(LV_DEBUG_ASSERT)
 endif()
 
 # Add LVGL subdirectory
+# 示例与 demo 默认会被编译（只是不链接），既浪费 2 分钟又会被 lv_conf 里的
+# 字体裁剪搞挂（lv_demo_benchmark 硬引用 montserrat_20）。产品不需要它们。
+set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CONFIG_LV_BUILD_DEMOS    OFF CACHE BOOL "" FORCE)
 add_subdirectory(lvgl)
 target_include_directories(lvgl PUBLIC ${PROJECT_SOURCE_DIR} ${SDL2_INCLUDE_DIRS})
 
@@ -124,7 +128,14 @@ else()
     message(STATUS "HAL backend: SDL2 (桌面模拟)")
 endif()
 
-set(MAIN_LIBS lvgl lvgl::examples lvgl::demos lvgl::thorvg ${SDL2_LIBRARIES})
+set(MAIN_LIBS lvgl ${SDL2_LIBRARIES})
+# 可选目标：关掉示例/demo/ThorVG 时它们不会被创建（见 add_subdirectory(lvgl) 上方），
+# 硬链接会直接让 cmake generate 失败 —— 用 TARGET 判断，裁剪开关才真正独立
+foreach(_opt lvgl::examples lvgl::demos lvgl::thorvg)
+    if(TARGET ${_opt})
+        list(APPEND MAIN_LIBS ${_opt})
+    endif()
+endforeach()
 
 # Create the main executable, depending on the FreeRTOS option
 if(USE_FREERTOS)

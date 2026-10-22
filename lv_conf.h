@@ -210,13 +210,13 @@
  *
  *  Enable: LV_USE_MATRIX
  */
-#define LV_USE_VECTOR_GRAPHIC 1
+#define LV_USE_VECTOR_GRAPHIC 0
 
 /** Render a widget and its children into an image buffer with lv_snapshot_take(). */
 #define LV_USE_SNAPSHOT 0
 
 /** Backend that gives the SW renderer vector graphics support. */
-#define LV_USE_THORVG 1
+#define LV_USE_THORVG 0
 
 #if LV_USE_THORVG
 /** Build the ThorVG copy shipped with LVGL instead of linking an external one. */
@@ -913,16 +913,16 @@
 #define LV_BIN_DECODER_RAM_LOAD 1
 
 /** PNG decoder (LodePNG) */
-#define LV_USE_LODEPNG 1
+#define LV_USE_LODEPNG 0
 
 /** PNG decoder (libpng) */
 #define LV_USE_LIBPNG 0
 
 /** BMP decoder */
-#define LV_USE_BMP 1
+#define LV_USE_BMP 0
 
 /** Also decodes split JPEG, a custom format optimized for embedded systems. */
-#define LV_USE_TJPGD 1
+#define LV_USE_TJPGD 0
 
 /** High-performance decoder supporting the complete JPEG specifications. */
 #define LV_USE_LIBJPEG_TURBO 0
@@ -1008,67 +1008,67 @@
 #define LV_FONT_MONTSERRAT_10 0
 
 /** Montserrat 12 */
-#define LV_FONT_MONTSERRAT_12 1
+#define LV_FONT_MONTSERRAT_12 0
 
 /** Montserrat 14 */
 #define LV_FONT_MONTSERRAT_14 1
 
 /** Montserrat 16 */
-#define LV_FONT_MONTSERRAT_16 1
+#define LV_FONT_MONTSERRAT_16 0
 
 /** Montserrat 18 */
-#define LV_FONT_MONTSERRAT_18 1
+#define LV_FONT_MONTSERRAT_18 0
 
 /** Montserrat 20 */
-#define LV_FONT_MONTSERRAT_20 1
+#define LV_FONT_MONTSERRAT_20 0
 
 /** Montserrat 22 */
-#define LV_FONT_MONTSERRAT_22 1
+#define LV_FONT_MONTSERRAT_22 0
 
 /** Montserrat 24 */
 #define LV_FONT_MONTSERRAT_24 1
 
 /** Montserrat 26 */
-#define LV_FONT_MONTSERRAT_26 1
+#define LV_FONT_MONTSERRAT_26 0
 
 /** Montserrat 28 */
-#define LV_FONT_MONTSERRAT_28 1
+#define LV_FONT_MONTSERRAT_28 0
 
 /** Montserrat 30 */
-#define LV_FONT_MONTSERRAT_30 1
+#define LV_FONT_MONTSERRAT_30 0
 
 /** Montserrat 32 */
 #define LV_FONT_MONTSERRAT_32 1
 
 /** Montserrat 34 */
-#define LV_FONT_MONTSERRAT_34 1
+#define LV_FONT_MONTSERRAT_34 0
 
 /** Montserrat 36 */
-#define LV_FONT_MONTSERRAT_36 1
+#define LV_FONT_MONTSERRAT_36 0
 
 /** Montserrat 38 */
-#define LV_FONT_MONTSERRAT_38 1
+#define LV_FONT_MONTSERRAT_38 0
 
 /** Montserrat 40 */
-#define LV_FONT_MONTSERRAT_40 1
+#define LV_FONT_MONTSERRAT_40 0
 
 /** Montserrat 42 */
-#define LV_FONT_MONTSERRAT_42 1
+#define LV_FONT_MONTSERRAT_42 0
 
 /** Montserrat 44 */
-#define LV_FONT_MONTSERRAT_44 1
+#define LV_FONT_MONTSERRAT_44 0
 
 /** Montserrat 46 */
-#define LV_FONT_MONTSERRAT_46 1
+#define LV_FONT_MONTSERRAT_46 0
 
 /** Montserrat 48 */
-#define LV_FONT_MONTSERRAT_48 1
+#define LV_FONT_MONTSERRAT_48 0
 
 /** Montserrat 28 (compressed) */
-#define LV_FONT_MONTSERRAT_28_COMPRESSED 1
+#define LV_FONT_MONTSERRAT_28_COMPRESSED 0
 
 /** Dejavu 16 (Persian, Hebrew, Arabic) */
-#define LV_FONT_DEJAVU_16_PERSIAN_HEBREW 1
+#define LV_FONT_DEJAVU_16_PERSIAN_HEBREW 0
 
 /** SourceHanSansSC 14 (CJK) */
 #define LV_FONT_SOURCE_HAN_SANS_SC_14_CJK 0
@@ -1079,7 +1079,7 @@
 #define LV_FONT_SOURCE_HAN_SANS_SC_16_CJK 0
 
 /** Pixel perfect monospaced fonts */
-#define LV_FONT_UNSCII_8 1
+#define LV_FONT_UNSCII_8 0
 
 /** UNSCII 16 */
 #define LV_FONT_UNSCII_16 0
@@ -1202,7 +1202,7 @@
 #endif /*LV_USE_FREETYPE*/
 
 /** Built-in TTF decoder */
-#define LV_USE_TINY_TTF 1
+#define LV_USE_TINY_TTF 0
 
 #if LV_USE_TINY_TTF
 /** Load TTF data from files */
@@ -1481,7 +1481,7 @@
  *
  *  Enable: LV_USE_CANVAS
  */
-#define LV_USE_QRCODE 1
+#define LV_USE_QRCODE 0
 
 /** Legacy rlottie binding, kept for compatibility. Use LV_USE_LOTTIE instead. */
 #define LV_USE_RLOTTIE 0
