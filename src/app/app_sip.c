@@ -202,16 +202,34 @@ static void safe_str(char *dst, size_t dsz, const char *src)
     snprintf(dst, dsz, "%s", src);
 }
 
-/* 探测本机出口 IP：连一下服务器地址，看内核选了哪块网卡（LAN 联调必需） */
+/* 探测本机出口 IP：连一下目标地址，看内核选了哪块网卡（LAN 联调必需）
+ *
+ * 探测目标优先级：SIP_LOCAL_IP（人工指定，多网卡板子必用）
+ *              > SIP_SERVER（走服务器形态）
+ *              > 8.8.8.8:53（点对点直呼形态，只看路由选卡，UDP connect 不发包）
+ *
+ * 注意：不做这层回退时，SIP_NO_REGISTER=1 且没填 SIP_SERVER 会让 s_local_ip
+ * 停在 127.0.0.1，SDP 的 c= 行就成了 127.0.0.1 —— 手机收到后把音频往自己发，
+ * 症状是"信令全对、两边都静音"，极难查。 */
 static void detect_local_ip(void)
 {
+    const char *fixed = getenv("SIP_LOCAL_IP");
+    if (fixed && *fixed) {
+        safe_str(s_local_ip, sizeof(s_local_ip), fixed);
+        return;
+    }
+
+    const char *target = (s_cfg.server[0] && strcmp(s_cfg.server, "0.0.0.0") != 0)
+                         ? s_cfg.server : "8.8.8.8";
+    uint16_t    tport  = (target == s_cfg.server) ? s_cfg.server_port : 53;
+
     sock_t t = socket(AF_INET, SOCK_DGRAM, 0);
     if (t == SOCK_INVALID) return;
     struct sockaddr_in dst;
     memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
-    dst.sin_port   = htons(s_cfg.server_port);
-    dst.sin_addr.s_addr = inet_addr(s_cfg.server);
+    dst.sin_port   = htons(tport);
+    dst.sin_addr.s_addr = inet_addr(target);
     if (connect(t, (struct sockaddr *)&dst, sizeof(dst)) == 0) {
         struct sockaddr_in me;
         int len = sizeof(me);
@@ -291,7 +309,18 @@ static void rtp_stop_media(void)
 }
 
 /*---------------------------------------------------------------------------
- * SDP：只谈一路 PCMA/8000（与海思/大华门口机一致）
+ * SDP：一路 PCMA/8000（与海思/大华门口机一致）+ 显式拒绝视频
+ *
+ * 为什么一定要写 m=video 这一行：
+ * RFC 3264 §6 要求 answer 的 m-line **条数与顺序都与 offer 一致**，
+ * 不支持的类型用 port=0 拒绝。手机上的 Linphone 默认带视频 offer，
+ * 如果我们的 answer 里只有 m=audio，它判为 SDP 无效 → 通话直接失败，
+ * 表现为"手机点呼叫就挂"。拒绝掉视频它才会降级成纯语音通话。
+ *
+ * P1 要收视频时把最后两行换成：
+ *   m=video <rtp_local+2> RTP/AVP <pt>   ← pt 必须用 offer 里给 H.264 的那个号
+ *   a=rtpmap:<pt> H.264/90000
+ *   a=recvonly                            ← 室内机只看不发，省掉编码器
  *---------------------------------------------------------------------------*/
 static int build_sdp(char *out, size_t sz)
 {
@@ -303,7 +332,9 @@ static int build_sdp(char *out, size_t sz)
         "t=0 0\r\n"
         "m=audio %u RTP/AVP 8\r\n"
         "a=rtpmap:8 PCMA/8000\r\n"
-        "a=sendrecv\r\n",
+        "a=sendrecv\r\n"
+        "m=video 0 RTP/AVP 0\r\n"
+        "a=inactive\r\n",
         (unsigned)rand(), s_local_ip, s_local_ip, s_call.rtp_local);
 }
 
@@ -1089,6 +1120,22 @@ static void rtp_on_readable(void)
                           (struct sockaddr *)&from, &fromlen);
     if (n <= 12) return;
     s_rtp_rx++;
+
+    /* 对称 RTP（RFC 4961）：以"实际收到包的源地址"为准回发，而不是照 SDP 里写的发。
+       手机 Linphone 开了 ICE 时 offer 的 c= 行是 0.0.0.0，NAT 后面端口也会变，
+       照 SDP 发等于发给空气 —— 症状是"手机能听到板子？不，是板子听不到手机 / 手机听不到板子"。
+       只在地址发生变化时校正一次，日志可见。 */
+    {
+        char ipbuf[64];
+        safe_str(ipbuf, sizeof(ipbuf), inet_ntoa(from.sin_addr));
+        uint16_t p = ntohs(from.sin_port);
+        if (strcmp(s_call.remote_ip, ipbuf) != 0 || s_call.rtp_remote != p) {
+            safe_str(s_call.remote_ip, sizeof(s_call.remote_ip), ipbuf);
+            s_call.rtp_remote = p;
+            printf("[rtp] peer learned %s:%u (symmetric rtp)\n", ipbuf, p);
+            fflush(stdout);
+        }
+    }
 
     if (s_rtp_echo) {
         sendto(s_rtp, (const char *)buf, n, 0, (struct sockaddr *)&from, fromlen);

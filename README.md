@@ -238,6 +238,9 @@ make debug                  # 开断言跑，查越界/野指针
 | 15 | 声音断续，播放欠载 400+ 次 | SDL 返回的是立体声设备，播放回调每 20ms 被要走 320 采样（单声道需求的两倍） | `SDL_OpenAudioDevice` 的 `allowed_changes` 传 0，强制 8k/单声道 |
 | 16 | 两个实例在同一秒启动，第二个呼出去被判成"重传"，打不进对端 | `srand(time(NULL))` 做种子 → 同秒启动的两个进程 `rand()` 序列**完全一样** → Call-ID 撞车，服务器当成同一笔对话 | Call-ID 里再加**进程号 + 通话序号**（`%08x%08x-%u-%u@ip`），三者缺一都可能撞 |
 | 17 | IP 直呼怎么都不响，换回走服务器就正常 | 呼出时 INVITE 一律发到 `SIP_SERVER`，而不是 Request-URI 里的 host —— 恰好"服务器地址=对端地址"时才通。UDP 无连接，发错地址**没有任何报错**，只表现为对方不响 | 新增 `uri_addr()` 从 Request-URI 解析目的地址，`send_msg_to()` 显式指定目标；CANCEL 也必须发同一地址 |
+| 18 | 手机 Linphone 一点呼叫就挂，日志里连 INVITE 都没走完 | SDP **answer 的 m-line 条数必须与 offer 一致**（RFC 3264 §6），不支持的类型用 `m=video 0` 拒绝。我们原来只回 `m=audio`，带视频 offer 的软电话判为 SDP 非法 | `build_sdp()` 末尾补 `m=video 0 RTP/AVP 0` + `a=inactive`；将来收视频改成 `recvonly` + 回显 offer 的 pt |
+| 19 | 不填 `SIP_SERVER` 的点对点模式下，双方都静音、信令却全对 | `detect_local_ip()` 原本朝服务器地址探测网卡，没服务器时探测失败 → `s_local_ip` 停在 `127.0.0.1` → SDP 里 `c=IN IP4 127.0.0.1` 发给对端，对端把音频**发给自己** | 无服务器时回退到 `8.8.8.8:53` 探测默认路由（UDP connect 不发包）；另加 `SIP_LOCAL_IP` 人工覆盖，**板子多网卡必用** |
+| 20 | 手机开了 ICE 时，板子发出去的音频对方收不到 | offer 的 `c=` 行是 `0.0.0.0`，NAT 后端口也会变 | 对称 RTP（RFC 4961）：以**实收 RTP 包的源地址**校正回发目标，日志打 `[rtp] peer learned` |
 
 > 第 6 条排查口诀：`ldd main.exe` 看依赖 → 程序目录优先于 PATH → 要么自带 DLL，要么静态链接（`-static`）。
 > 第 7、8 条是同一类问题：**Windows 上构建失败的根因经常不在代码，而在"谁替你启动了编译器"**。
@@ -326,6 +329,9 @@ SIP_TONE=1 make run                                                          # �
 - [ ] **M5**：全功能量化压测（每个里程碑过一遍 stress，出 stats.csv 曲线）
 - [ ] **M6（等板子）**：`hal_fbdev.c`/`hal_audio.c`（ALSA）+ 交叉编译 + 思必驰/eXosip 实装
 - [ ] **M3 剩余**：视频（H.264 解码 + `lv_image` 显示）—— 室内机"可视"对讲的最后一块
+  - 测试方案已定：**手机装 Linphone 点对点直呼板子**，不架服务器，手机冒充门外机发声视频，
+    板子 `recvonly` 只收不看。分 P0 语音 / P1 `ffplay` 验流 / P2 解码上屏三段。
+    见 [`docs/音视频对讲测试方案.md`](docs/音视频对讲测试方案.md)
 
 ## 参考
 
