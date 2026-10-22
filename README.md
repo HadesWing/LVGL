@@ -19,6 +19,7 @@
 | `src/hal/` | **平台相关**驱动层：`hal_sdl.c`（Win/Linux 桌面）、`hal_fbdev.c`（Linux 真机，P1 待实现） |
 | `src/main.c` | 应用入口 + 心跳循环（`lv_init` → `hal_init` → `ui_init` → `lv_timer_handler`） |
 | `Makefile` | **一键入口**（转发给 `scripts/dev.sh`） |
+| `build.cmd` | 免 PATH 的等价入口（`build.cmd build` / `build.cmd run` / `build.cmd stress` …） |
 | `scripts/dev.sh` | 真正的构建/运行/压测脚本（MSYS2 环境、避开中文路径、并发生死锁规避） |
 | `lv_conf.h` | **LVGL 配置总开关**（内存池大小、断言、性能监视器，见"踩坑记录"第 4 条） |
 | `CMakeLists.txt` | 构建脚本（lvgl 作为子模块引入；`-DLV_MEM_SIZE` / `-DLV_DEBUG_ASSERT` / `-DLVGL_HAL`） |
@@ -68,6 +69,9 @@ make run        # 只运行
 ```
 
 就这三条，不需要记 cmake / ninja 的参数，也不用先进 MSYS2 终端。
+
+> **`make` 提示"不是内部或外部命令"？** 说明当前终端是加 PATH 之前打开的。
+> 两种解法：① 关掉重开一个终端；② 直接用 `build.cmd build`（等价，且不依赖 PATH）。
 
 `Makefile` 只是转发壳，真正干活的是 `scripts/dev.sh`（原因见"踩坑记录"第 7、8 条）。
 常用变体：

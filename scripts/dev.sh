@@ -96,6 +96,7 @@ case "$CMD" in
     mem)
         # 任意内存池大小：make mem SIZE=32768
         SIZE="${1:-65536}"
+        SIZE="${SIZE#SIZE=}"   # 兼容 make mem SIZE=32768 与 build.cmd mem SIZE=32768
         BUILD_DIR="build-mem$SIZE"
         configure -DLV_MEM_SIZE="$SIZE" -DMAIN_EXE_NAME=main64
         compile
