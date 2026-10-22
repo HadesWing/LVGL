@@ -28,23 +28,36 @@ SIP_SERVER=127.0.0.1 SIP_PORT=5060 SIP_USER=1001 SIP_PASS=1234 SIP_LOCAL_PORT=50
 
 服务端打印 `digest OK` 表示 RFC 2617 摘要两端算对。
 
-## 二、真实方案：miniSIPServer（免费版 ≤5 用户）
+## 二、真实方案：miniSIPServer（免费版 5 个分机）
 
-下载：https://www.myvoipuser.com/download/ （`mss_v70_u5.exe`，Windows）
+**官方站点：`myvoipapp.com`（不是 myvoipuser / minisipserver.com 只是别名）**
 
-1. 安装后启动，默认监听 UDP 5060；
-2. 添加两个分机：`1001` / `1002`，密码自定；
-3. 客户端起两个实例（注意本机端口错开）：
+| 项 | 值 |
+|----|-----|
+| 下载页 | https://www.myvoipapp.com/download/index.html |
+| 免费版直链（5 clients） | https://www.myvoipapp.com/download/mss_v70/mss_v70_u5.exe |
+| 版本 | V70 build 20261020，约 8 MB，需交互安装（一路 Next） |
+| 授权 | `u5` = 5 个分机免费无限期；`u20/u50/u100/u300/u500` 为 30 天全功能试用 |
+
+> 本机已下载好安装包：`C:\sip_tools\mss_v70_u5.exe`（免去找链接），双击安装即可。
+
+安装与配置：
+
+1. 安装后启动 `mss.exe`（或桌面快捷方式），默认监听 **UDP 5060**，主界面会显示本机 SIP 地址；
+2. **默认已预置三个分机**：`100 / 101 / 102`，密码与分机号相同 —— 想省事直接用；
+   要加自己的分机：菜单 `数据(D) → 分机`，填「分机号 / 密码 / 描述」，默认拨号计划 `default`；
+3. 客户端起两个实例（本机端口必须错开，否则 bind 失败）：
 
 ```bash
-# 室内机（本工程）
+# 室内机（本工程），1001
 SIP_SERVER=127.0.0.1 SIP_PORT=5060 SIP_USER=1001 SIP_PASS=1234 SIP_LOCAL_PORT=5062 ./bin/main.exe
 
-# 对端软终端：MicroSIP / Zoiper 注册 1002（或再起一个 main.exe 配 1002）
+# 对端：MicroSIP 注册 1002（或再起一个 main.exe，SIP_LOCAL_PORT=5064）
 ```
 
-4. 真实服务器通常开启 401 认证 —— 本客户端已实现 Digest（qop=auth 与无 qop 两种），
-   若注册失败看服务端日志里 nonce 是否刷新（重放检测）。
+4. miniSIPServer 默认**按用户名+密码做 401 认证**（也可勾 "IP address authorization" 改成 IP 放行）；
+   本客户端已实现 Digest（qop=auth 与无 qop 两种），注册失败先看服务端日志窗口；
+5. 呼叫：分机互拨直接拨对方号码（如 `1001`），出群呼叫要在号码前加前缀 `9`。
 
 ## 三、已知坑（客户端侧，均已修复/规避）
 
