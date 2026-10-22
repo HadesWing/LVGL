@@ -15,7 +15,7 @@
 | 目录 | 内容 |
 |---|---|
 | `src/ui/` | **平台无关**界面层：`ui_theme.c`（命名样式 + 明暗主题）、`ui_indoor.c`（室内机主界面） |
-| `src/app/` | **平台无关**应用层：`app_stats.c`（FPS/内存/循环耗时埋点）、`app_mock.c`（设备事件模拟 + 压测） |
+| `src/app/` | **平台无关**应用层：`app_events.c`（事件总线，跨线程→主线程收口）、`app_devices.c`（设备模型+场景+持久化）、`app_stats.c`（FPS/内存埋点）、`app_mock.c`（设备事件模拟 + 压测） |
 | `src/hal/` | **平台相关**驱动层：`hal_sdl.c`（Win/Linux 桌面）、`hal_fbdev.c`（Linux 真机，P1 待实现） |
 | `src/main.c` | 应用入口 + 心跳循环（`lv_init` → `hal_init` → `ui_init` → `lv_timer_handler`） |
 | `Makefile` | **一键入口**（转发给 `scripts/dev.sh`） |
@@ -258,8 +258,8 @@ make debug                  # 开断言跑，查越界/野指针
 - [x] **Day 2-e**：内存与性能量化（`lv_mem_monitor` / FPS / 主循环耗时 / 30 秒压测零泄漏）
 - [x] **Day 2-g**：一键构建（`make build` / `make run` / 内存与压测变体）
 - [x] **产品规划**：智能家居中控台三大功能拆解（`docs/产品规划_智能家居中控台.md`）
-- [ ] **M1**：中控台骨架 —— flex/grid 主页 + 设备模型 + 事件总线 + 页面栈
-- [ ] **M2**：语音链路 —— 唤醒状态机 + 中文意图解析 + 执行反馈动画
+- [x] **M1**：中控台骨架 —— flex/grid 主页（状态栏/房间页签/设备卡片网格/场景条）+ 设备模型 + 事件总线；页面栈留 M3 对讲页接入
+- [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析
 - [ ] **M3**：SIP 对讲 —— 呼叫状态机 + 来电横幅 + 对讲页
 - [ ] **M4**：中文点阵字体（lv_font_conv）+ 图标资源
 - [ ] **M5**：全功能量化压测（每个里程碑过一遍 stress，出 stats.csv 曲线）

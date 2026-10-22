@@ -28,7 +28,10 @@
 #include <SDL.h>
 
 #include "hal/hal.h"
-#include "ui/ui_indoor.h"
+#include "ui/ui_home.h"
+#include "ui/ui_theme.h"
+#include "app/app_events.h"
+#include "app/app_devices.h"
 #include "app/app_stats.h"
 #include "app/app_mock.h"
 
@@ -81,7 +84,10 @@ int main(int argc, char **argv)
   /* - lv_example_label_1(); */
   /* - etc. */
   /* lv_demo_widgets();            ← 官方 demo（学习对照用） */
-  ui_indoor_init();               /* ← 自研界面：室内机主界面 */
+  ui_theme_init(UI_THEME_LIGHT);  /* ← 主题/命名样式（先于一切界面） */
+  app_events_init();              /* ← 事件总线（主线程分发 timer） */
+  app_devices_init();             /* ← 设备模型（加载持久化状态） */
+  ui_home_init();                 /* ← M1：智能家居中控台主页 */
   app_stats_init();               /* ← 内存/帧率/循环耗时埋点 */
   app_mock_init();                /* ← 设备事件模拟（无板联调用） */
 

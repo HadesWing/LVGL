@@ -4,9 +4,13 @@
  *
  * 【日志一律英文】Windows 控制台默认 GBK，源码是 UTF-8，中文 printf 会乱码；
  * 嵌入式现场也常用英文日志，这里统一用英文便于 grep 与交叉比对。
+ *
+ * 【M1 变化】mock 不再直接碰 UI，全部走事件总线/设备层 —— 与真实来源
+ * （思必驰回调 / SIP INVITE）在同一条数据通路上，将来换实现 UI 无感。
  */
 #include "app_mock.h"
-#include "ui_indoor.h"
+#include "app_events.h"
+#include "app_devices.h"
 #include "ui_theme.h"
 #include "lvgl.h"
 
@@ -18,17 +22,18 @@
  * 模拟的语音指令表（真实设备里这些来自思必驰 ASR 的语义结果）
  *---------------------------------------------------------------------------*/
 typedef struct {
-    const char *asr_text;   /* ASR 识别文本（日志用） */
-    const char *intent;     /* 语义意图 */
-    const char *ui_hint;    /* 回显到界面状态行 */
+    const char *asr;        /* ASR 识别文本（事件里回显） */
+    const char *id;         /* 目标设备 */
+    device_action_t act;
+    int16_t val;
 } mock_voice_t;
 
 static const mock_voice_t s_voices[] = {
-    { "turn on living room light", "LIGHT_ON",    "Voice: LIGHT_ON"    },
-    { "close the curtain",         "CURTAIN_CLOSE","Voice: CURTAIN_CLOSE" },
-    { "set ac to 26 degree",       "AC_26",       "Voice: AC_26"       },
-    { "call the property office",  "CALL_GUARD",  "Voice: CALL_GUARD"  },
-    { "unlock the door",           "DOOR_UNLOCK", "Voice: DOOR_UNLOCK" },
+    { "打开客厅灯",   "light_living", CMD_ON,   0  },
+    { "关闭客厅灯",   "light_living", CMD_OFF,  0  },
+    { "打开窗帘",     "curt_living",  CMD_ON,   0  },
+    { "空调调到26度", "ac_living",    CMD_SET,  26 },
+    { "打开新风机",   "fresh_living", CMD_ON,   0  },
 };
 static uint32_t s_voice_idx;
 
@@ -40,19 +45,22 @@ static void call_timer_cb(lv_timer_t *t)
     (void)t;
     printf("[mock] door station 101 -> CALL (simulated SIP INVITE)\n");
     fflush(stdout);
-    ui_indoor_simulate_call();
+    app_events_post(EV_SIP_STATE, 2, 0, NULL);   /* 2 = incoming，M3 接对讲页 */
 }
 
 /*---------------------------------------------------------------------------
- * 定时器：模拟语音识别结果（真实来源 = 思必驰 SDK 回调）
+ * 定时器：模拟语音识别结果（真实来源 = 思必驰/sherpa-onnx SDK 回调）
  *---------------------------------------------------------------------------*/
 static void voice_timer_cb(lv_timer_t *t)
 {
     (void)t;
     const mock_voice_t *v = &s_voices[s_voice_idx++ % (sizeof(s_voices) / sizeof(s_voices[0]))];
-    printf("[mock] asr=\"%s\" -> intent=%s\n", v->asr_text, v->intent);
+    printf("[mock] asr=\"%s\" -> device %s action %d\n", v->asr, v->id, (int)v->act);
     fflush(stdout);
-    ui_indoor_set_status_text(v->ui_hint);
+
+    app_events_post(EV_VOICE_TEXT, 0, 0, v->asr);            /* 字幕 */
+    device_cmd_t cmd = { v->id, v->act, v->val };            /* 执行 */
+    device_execute(&cmd);
 }
 
 /*---------------------------------------------------------------------------
@@ -62,6 +70,7 @@ static void voice_timer_cb(lv_timer_t *t)
 static void stress_timer_cb(lv_timer_t *t)
 {
     (void)t;
+    static uint32_t round;
 
     /* 1) 建 8 个临时控件，立刻删掉 —— 若内存池 used 长期上涨，就是泄漏 */
     for (int i = 0; i < 8; i++) {
@@ -74,10 +83,10 @@ static void stress_timer_cb(lv_timer_t *t)
     /* 2) 主题来回切 —— 检查样式热替换有没有残留 */
     ui_theme_toggle();
 
-    /* 3) 触发一次来电 —— 检查弹窗动画重复触发 */
-    ui_indoor_simulate_call();
+    /* 3) 翻转一个设备 —— 全链路压测：执行→落盘→事件→UI 刷新 */
+    device_toggle_by_index((int)(round++ % 4));
 
-    printf("[stress] churn 8 objects + theme toggle + call\n");
+    printf("[stress] churn 8 objects + theme toggle + device toggle\n");
     fflush(stdout);
 }
 
@@ -94,12 +103,13 @@ void app_mock_init(void)
 
     const char *stress_env = getenv("LVGL_STRESS");
     if (stress_env && strcmp(stress_env, "0") != 0) {
-        printf("[mock] STRESS MODE: object churn + theme toggle + call\n");
+        printf("[mock] STRESS MODE: object churn + theme toggle + device churn\n");
         lv_timer_create(stress_timer_cb, 200, NULL);
         return;                       /* 压测时不叠加常规事件，避免干扰读数 */
     }
 
     printf("[mock] device simulator on: call / asr events\n");
+    app_events_post(EV_SIP_STATE, 1, 0, NULL);   /* 1 = online */
     lv_timer_create(call_timer_cb, 12000, NULL);
     lv_timer_create(voice_timer_cb, 9000, NULL);
 }

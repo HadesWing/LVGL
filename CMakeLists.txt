@@ -93,6 +93,9 @@ set(LVGL_HAL "sdl" CACHE STRING "HAL backend: sdl | fbdev")
 set(MAIN_SOURCES src/mouse_cursor_icon.c
                  src/ui/ui_theme.c
                  src/ui/ui_indoor.c
+                 src/ui/ui_home.c
+                 src/app/app_events.c
+                 src/app/app_devices.c
                  src/app/app_stats.c
                  src/app/app_mock.c)
 
