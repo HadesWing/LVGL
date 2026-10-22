@@ -10,6 +10,7 @@
 #   make mem SIZE=32768   任意内存池大小（找崩溃边界用）
 #   make debug      开 LVGL 断言运行（查越界/野指针，性能会下降）
 #   make longrun    30 分钟长稳（到点打印汇总并退出）
+#   make duo        双端互通：本机起两个实例（室内机 + 客户端），双向音频各验一次
 #   make rebuild    全量重编
 #   make clean      删构建目录
 #   make help       显示帮助
@@ -26,7 +27,7 @@ endif
 
 DEV := $(BASH) scripts/dev.sh
 
-.PHONY: all build run rebuild stats stress mem64 mem debug longrun clean help
+.PHONY: all build run rebuild stats stress mem64 mem debug longrun duo clean help
 
 all: build run
 
@@ -57,6 +58,9 @@ debug:
 
 longrun:
 	@$(DEV) longrun
+
+duo:
+	@$(BASH) scripts/duo_test.sh $(SEC)
 
 clean:
 	@$(DEV) clean

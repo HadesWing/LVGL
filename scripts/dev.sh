@@ -163,6 +163,7 @@ make rebuild      全量重编（= clean + build）
 make clean        删除所有构建目录
 
 带参数的 PC 工具（走 bash 直接调）：
+  bash scripts/duo_test.sh [秒]               双端互通：本机两个实例（室内机+客户端）双向音频各验一次
   bash scripts/dev.sh echo                     起 SIP 回声应答器
   bash scripts/dev.sh probe <file.h264>        离线 H.264 解码探针：打印单帧耗时
   bash scripts/dev.sh probe <file.h264> --rgb565 frame.raw   额外导出 RGB565 帧
