@@ -123,6 +123,16 @@ case "$CMD" in
         need_exe "$EXE_NAME"
         cd bin && LVGL_STATS=1 LVGL_RUN_SEC="${LVGL_RUN_SEC:-1800}" exec "./$EXE_NAME"
         ;;
+    echo)
+        # 板端自测：内置 SIP 回声应答器（纯 C + libosip2，不依赖 LVGL/SDL/Python）
+        #   终端 A：make echo            → 应答器监听 SIP 5090 / RTP 5092
+        #   终端 B：SIP_SERVER=127.0.0.1 SIP_PORT=5090 SIP_USER=echo \
+        #           SIP_AUTOCALL=echo SIP_AUTOHANGUP=10 SIP_TONE=1 make run
+        cmake -G Ninja -S tools/sip_echo -B build-echo -DCMAKE_BUILD_TYPE=Release
+        ninja -C build-echo -j "${JOBS:-4}"
+        echo "✅ 应答器：$(pwd)/bin/sip_echo$SUFFIX"
+        cd bin && exec "./sip_echo$SUFFIX" "$@"
+        ;;
     clean)
         cmake -E rm -rf build build-64k build-debug
         rm -rf build-mem* 2>/dev/null || true
@@ -139,6 +149,7 @@ make mem64        64KB 内存池运行（模拟小内存设备）
 make mem SIZE=N   指定内存池大小（例：make mem SIZE=40960）
 make debug        开 LVGL 断言运行（查越界/野指针，性能会掉）
 make longrun      30 分钟长稳，到点打印汇总并退出
+make echo         板端自测：内置 SIP 回声应答器（纯 C，无需 Python/PC）
 make rebuild      全量重编（= clean + build）
 make clean        删除所有构建目录
 

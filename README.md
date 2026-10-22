@@ -236,6 +236,8 @@ make debug                  # 开断言跑，查越界/野指针
 | 13 | 新字库编译通过，但屏幕上**一个字都画不出来**，日志刷 `Compressed fonts is used but LV_USE_FONT_COMPRESSED is not enabled` | lv_font_conv 默认输出 RLE 压缩字形，而 `lv_conf.h` 里解码开关是关的 | 开 `LV_USE_FONT_COMPRESSED`（更弱的 MCU 可用 `--no-compress` 重生成） |
 | 14 | 通话一接通就自动挂断，RTP 只发出去 1 个包 | Windows WASAPI 首次打开音频设备耗时 1~3s，被算进了通话时长（`t_answer_ms` 早于开声卡） | 计时起点挪到 `rtp_start_media()` **之后** |
 | 15 | 声音断续，播放欠载 400+ 次 | SDL 返回的是立体声设备，播放回调每 20ms 被要走 320 采样（单声道需求的两倍） | `SDL_OpenAudioDevice` 的 `allowed_changes` 传 0，强制 8k/单声道 |
+| 16 | 两个实例在同一秒启动，第二个呼出去被判成"重传"，打不进对端 | `srand(time(NULL))` 做种子 → 同秒启动的两个进程 `rand()` 序列**完全一样** → Call-ID 撞车，服务器当成同一笔对话 | Call-ID 里再加**进程号 + 通话序号**（`%08x%08x-%u-%u@ip`），三者缺一都可能撞 |
+| 17 | IP 直呼怎么都不响，换回走服务器就正常 | 呼出时 INVITE 一律发到 `SIP_SERVER`，而不是 Request-URI 里的 host —— 恰好"服务器地址=对端地址"时才通。UDP 无连接，发错地址**没有任何报错**，只表现为对方不响 | 新增 `uri_addr()` 从 Request-URI 解析目的地址，`send_msg_to()` 显式指定目标；CANCEL 也必须发同一地址 |
 
 > 第 6 条排查口诀：`ldd main.exe` 看依赖 → 程序目录优先于 PATH → 要么自带 DLL，要么静态链接（`-static`）。
 > 第 7、8 条是同一类问题：**Windows 上构建失败的根因经常不在代码，而在"谁替你启动了编译器"**。
@@ -282,6 +284,33 @@ if (o->layout.home_style == OEM_HOME_LIST) build_list(...); /* 结构 */
 
 **新增中文文案后必须重跑** `python scripts/gen_font.py`，否则字库缺字会显示方框。
 
+## 交付形态：目标机上没有 Python
+
+产品最终跑在 RK3308 上，**板子里没有解释器，车间/客户现场也没有 PC**。
+所以代码库按"能不能上板"分成三类，边界写在 `docs/SIP联调环境.md` 第 0 节：
+
+| 类别 | 例子 | 上板吗 |
+|---|---|---|
+| **产品代码** | `src/**/*.c` | 是（交叉编译成 `main`） |
+| **板端工具** | `tools/sip_echo/`（纯 C 应答器，只依赖 libosip2） | 是，可一起交叉编译 —— 板子自己测自己 |
+| **PC 工具** | `scripts/gen_font.py`、`scripts/fake_sip_*.py`、`scripts/dev.sh` | 否（构建期 / 开发期） |
+
+两条硬约束：
+
+1. **构建不吃 Python**：`CMakeLists.txt` 里没有一处 `execute_process(python ...)`；
+   字库等生成物都是**提交进仓库的普通 `.c`**，板子上 `cmake -B build && ninja` 即可。
+   `gen_font.py` 只在**新增中文文案**时于 PC 上跑一次，生成结果随代码一起提交。
+2. **运行不吃 Python**：联调对端从 Python 假服务器换成 `tools/sip_echo`（300 行 C），
+   配合 `SIP_TONE=1`（无麦克风合成 1kHz 音源）和 `SIP_AUTOCALL` / `SIP_AUTOHANGUP`，
+   全程脚本化，无需人工点击：
+
+```bash
+make echo                                                                    # 终端 A：应答器
+SIP_SERVER=127.0.0.1 SIP_PORT=5090 SIP_AUTOCALL=echo SIP_AUTOHANGUP=6 \
+SIP_TONE=1 make run                                                          # 终端 B：被测端
+# → [rtp] stats rx=298 tx=299 dur=6s (pps=49.8)
+```
+
 ## 学习路线
 
 - [x] **Day 1**：环境搭建、编译、跑通官方 demo（Widgets）
@@ -291,7 +320,7 @@ if (o->layout.home_style == OEM_HOME_LIST) build_list(...); /* 结构 */
 - [x] **产品规划**：智能家居中控台三大功能拆解（`docs/产品规划_智能家居中控台.md`）
 - [x] **M1**：中控台骨架 —— flex/grid 主页 + **三级信息架构**（分类宫格 → 房间页签 → 设备详情）+ 设备模型 + 事件总线 + ini 持久化
 - [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析（**当前用 app_mock 模拟 ASR 事件**）
-- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**，见 `docs/SIP联调环境.md`
+- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**；另有板端自测工具 `tools/sip_echo`（纯 C 应答器，陪产品一起上板）。见 `docs/SIP联调环境.md`
 - [x] **M4（部分）**：中文按需子集字库（`scripts/gen_font.py` → `src/ui/fonts/`，212 汉字 × 16/24px），**修掉了"灯/调/风/插/线"显示成方框的问题**
 - [x] **OEM 定制层**（超出原计划）：`src/oem/` 一套接口 + 两套 profile，运行期 `OEM_PROFILE=alt` 热切换宫格/列表两套首页，见 `docs/OEM定制指南.md`
 - [ ] **M5**：全功能量化压测（每个里程碑过一遍 stress，出 stats.csv 曲线）

@@ -130,6 +130,19 @@ static uint64_t now_ms(void)
 #endif
 }
 
+/* 进程号：Call-ID 里必须带上。
+   踩过的坑：srand(time(NULL)) 做种子，两台设备（或同机两个实例）在同一秒启动
+   → rand() 序列完全相同 → Call-ID 撞车。服务器会当成同一笔对话，第二路
+   直接被判成重传，表现为"打不进去/对话被顶掉一个"。 */
+static unsigned proc_id(void)
+{
+#ifdef _WIN32
+    return (unsigned)GetCurrentProcessId();
+#else
+    return (unsigned)getpid();
+#endif
+}
+
 static void set_state(sip_state_t st)
 {
     s_state = st;
@@ -260,6 +273,8 @@ static void rtp_start_media(void)
     /* SIP_RTP_ECHO=1 时强制回声（CI/无声卡环境验证媒体通路用），否则尝试开声卡 */
     if (getenv("SIP_RTP_ECHO")) {
         s_rtp_echo = true;
+    } else if (getenv("SIP_NO_AUDIO")) {
+        s_rtp_echo = false;      /* 纯信令回归：完全不碰声卡；发不发由 SIP_TONE 决定 */
     } else {
         s_rtp_echo = !app_audio_open();
     }
@@ -437,7 +452,48 @@ static int send_raw(const char *data, size_t len, const struct sockaddr_in *to)
     return 0;
 }
 
+static int send_msg_to(osip_message_t *msg, const struct sockaddr_in *to);
+
 static int send_msg(osip_message_t *msg)
+{
+    return send_msg_to(msg, NULL);
+}
+
+/* 从 sip:user@host:port 里解析出目的地址。
+   【为什么需要】INVITE 是"发给 Request-URI 指向的那台设备"，不是"发给服务器"。
+   之前 send_msg() 一律发到 s_cfg.server，于是只有"服务器地址恰好等于对端地址"
+   时才能打通（走 miniSIPServer 时碰巧成立，一旦 IP 直呼就发错地方）。
+   UDP 无连接，发错地址不会有任何报错，只表现为"对端一直不响"。 */
+static int uri_addr(const char *uri, struct sockaddr_in *out)
+{
+    if (!uri || !*uri || !out) return -1;
+    const char *at = strrchr(uri, '@');
+    const char *host = at ? at + 1 : (strncmp(uri, "sip:", 4) == 0 ? uri + 4 : uri);
+
+    char hbuf[64];
+    int port = 5060;
+    const char *colon = strrchr(host, ':');
+    if (colon) {
+        size_t n = (size_t)(colon - host);
+        if (n == 0 || n >= sizeof(hbuf)) return -1;
+        memcpy(hbuf, host, n);
+        hbuf[n] = '\0';
+        port = atoi(colon + 1);
+    } else {
+        safe_str(hbuf, sizeof(hbuf), host);
+        char *semi = strchr(hbuf, ';');     /* 去掉 ;transport=udp 这类参数 */
+        if (semi) *semi = '\0';
+    }
+    if (port <= 0) port = 5060;
+
+    memset(out, 0, sizeof(*out));
+    out->sin_family = AF_INET;
+    out->sin_port = htons((uint16_t)port);
+    out->sin_addr.s_addr = inet_addr(hbuf);
+    return (out->sin_addr.s_addr == INADDR_NONE) ? -1 : 0;
+}
+
+static int send_msg_to(osip_message_t *msg, const struct sockaddr_in *to)
 {
     char *dest = NULL;
     size_t len = 0;
@@ -448,7 +504,7 @@ static int send_msg(osip_message_t *msg)
     if (head_len > 200) head_len = 200;
     printf("[sip] >> %.*s\n", head_len, dest);
 
-    int rc = send_raw(dest, len, NULL);
+    int rc = send_raw(dest, len, to);
     fflush(stdout);
     osip_free(dest);
     return rc;
@@ -652,8 +708,10 @@ int app_sip_call(const char *target)
     s_call.remote_ip[0] = '\0';
     s_call.t_start_ms = now_ms();
     snprintf(s_call.local_tag, sizeof(s_call.local_tag), "ind%u", (unsigned)(now_ms() & 0xffffff));
-    snprintf(s_call.h.call_id, sizeof(s_call.h.call_id), "%08x%08x@%s",
-             (unsigned)rand(), (unsigned)rand(), s_local_ip);
+    /* Call-ID 必须全局唯一：随机数 + 进程号 + 通话序号，三者缺一都可能撞车 */
+    static unsigned s_call_seq;
+    snprintf(s_call.h.call_id, sizeof(s_call.h.call_id), "%08x%08x-%u-%u@%s",
+             (unsigned)rand(), (unsigned)rand(), proc_id(), ++s_call_seq, s_local_ip);
     safe_str(s_call.peer, sizeof(s_call.peer), target);
 
     if (strchr(target, '@')) {
@@ -668,8 +726,13 @@ int app_sip_call(const char *target)
 
     osip_message_t *msg = NULL;
     build_invite(&msg);
-    int rc = msg ? send_msg(msg) : -1;
-    if (msg) osip_message_free(msg);
+    int rc = -1;
+    if (msg) {
+        /* 发给 Request-URI 指向的那台对端；解析不出 IP（用了域名）才退回服务器 */
+        struct sockaddr_in dst;
+        rc = (uri_addr(s_call.peer_uri, &dst) == 0) ? send_msg_to(msg, &dst) : send_msg(msg);
+        osip_message_free(msg);
+    }
     printf("[sip] INVITE -> %s\n", s_call.peer_uri);
     fflush(stdout);
     return rc;
@@ -730,7 +793,9 @@ int app_sip_hangup(void)
             s_call.h.call_id, s_call.invite_cseq);
         printf("[sip] >> CANCEL (cseq=%d branch=%s)\n", s_call.invite_cseq, s_call.invite_branch);
         fflush(stdout);
-        send_raw(buf, strlen(buf), NULL);   /* 走代理 */
+        /* CANCEL 也必须发给 INVITE 去的同一个地址，否则对端根本不知道你在取消 */
+        struct sockaddr_in dst;
+        send_raw(buf, strlen(buf), (uri_addr(s_call.peer_uri, &dst) == 0) ? &dst : NULL);
 
         /* 关键：**不能立刻 call_reset**。487 回来后还要按 RFC 回一个 ACK，
            那时需要 branch / CSeq / Call-ID。所以只把"已取消"标记挂上，
@@ -754,6 +819,18 @@ int app_sip_hangup(void)
 /*---------------------------------------------------------------------------
  * 收包处理
  *---------------------------------------------------------------------------*/
+/* 自测用：进入在线状态后自动呼出一次。
+   SIP_AUTOCALL=1002（走服务器）或 sip:1002@192.168.1.10:5062（IP 直呼，无需服务器）。
+   注册成功与点对点模式两条路都要走它，所以抽成函数。 */
+static void try_autocall_once(void)
+{
+    static int done;
+    const char *ac = getenv("SIP_AUTOCALL");
+    if (!ac || !*ac || done || s_state != SIP_ONLINE) return;
+    done = 1;
+    app_sip_call(ac);
+}
+
 static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
 {
     int code = msg->status_code;
@@ -771,14 +848,7 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
         printf("[sip] registered (expires=%d)\n", s_expires);
         fflush(stdout);
         /* 自测用：注册成功后自动呼出（SIP_AUTOCALL=1002） */
-        {
-            static int autocall_done = 0;
-            const char *ac = getenv("SIP_AUTOCALL");
-            if (ac && *ac && !autocall_done && s_state == SIP_ONLINE) {
-                autocall_done = 1;
-                app_sip_call(ac);
-            }
-        }
+        try_autocall_once();
         return;
     }
     if (s_reg_pending && (code == 401 || code == 407)) {
@@ -1198,7 +1268,9 @@ static void *recv_loop(void *arg)
         osip_message_t *msg = NULL;
         if (osip_message_init(&msg) != 0) continue;
         if (osip_message_parse(msg, buf, (size_t)n) != 0) {
-            printf("[sip] parse failed (%d bytes)\n", n);
+            /* 打出首行：解析失败十次有九次是对方回了个畸形响应，
+               只看"parse failed"根本没法判断是哪个字段坏了 */
+            printf("[sip] parse failed (%d bytes): %.48s\n", n, buf);
             fflush(stdout);
             osip_message_free(msg);
             continue;
@@ -1218,10 +1290,14 @@ static void *recv_loop(void *arg)
 bool app_sip_init_from_env(void)
 {
     const char *server = getenv("SIP_SERVER");
-    if (!server || !*server) {
+    /* 点对点模式（SIP_NO_REGISTER）不需要服务器：门口机与室内机直连、
+       或者拿 MicroSIP 直接打 IP 联调，都属于这种场景 */
+    bool p2p = getenv("SIP_NO_REGISTER") != NULL;
+    if ((!server || !*server) && !p2p) {
         printf("[sip] SIP_SERVER not set -> SIP disabled (UI-only mode)\n");
         return false;
     }
+    if (!server || !*server) server = "127.0.0.1";   /* p2p 时仅用于拼默认 URI */
     s_cfg.server      = server;
     s_cfg.server_port = (uint16_t)atoi(getenv("SIP_PORT") ? getenv("SIP_PORT") : "5060");
     s_cfg.user        = getenv("SIP_USER") ? getenv("SIP_USER") : "1001";
@@ -1232,7 +1308,8 @@ bool app_sip_init_from_env(void)
     /* 强迫回声模式（CI 无麦克风时用，验证媒体双向通路而不依赖声卡） */
     s_rtp_echo = getenv("SIP_RTP_ECHO") != NULL;
     srand((unsigned)time(NULL));
-    snprintf(s_regid, sizeof(s_regid), "indoor-%u@%s", (unsigned)rand(), s_local_ip);
+    snprintf(s_regid, sizeof(s_regid), "indoor-%08x-%u@%s",
+             (unsigned)rand(), proc_id(), s_local_ip);
     printf("[sip] cfg: %s:%u user=%s local=%u\n",
            s_cfg.server, s_cfg.server_port, s_cfg.user, s_cfg.local_port);
     return true;
@@ -1275,10 +1352,28 @@ void app_sip_start(void)
     pthread_create(&s_thread, NULL, recv_loop, NULL);
 #endif
     rtp_open();
+
+    /* 预开音频设备。室内机是固定功能设备，"上电就把声卡拿到手"是合理策略：
+       否则第一次接听时 SDL/WASAPI 才去枚举设备，桌面实测要 1~5 秒
+       （本机没有采集设备时更久），整段延后都压在接听路径上，
+       表现为"按了接听，几秒后才听见声音"。板端 ALSA 只要几十毫秒，
+       但道理一样 —— 建链路径里不该有阻塞式设备初始化。 */
+    if (!getenv("SIP_RTP_ECHO") && !getenv("SIP_NO_AUDIO")) app_audio_open();
+
     printf("[sip] listening on udp/%u\n", s_cfg.local_port);
     fflush(stdout);
 
-    send_register();
+    /* 点对点模式（SIP_NO_REGISTER=1）：不注册直接置在线。
+       ① 有些项目根本没有平台/服务器，门口机与室内机直连（IP 直呼）；
+       ② 联调时想让 MicroSIP 直接打 IP 当对端，也不需要 registrar。
+       注意 s_registered 保持 false —— 否则 recv_loop 会按 Expires 去续注册。 */
+    if (getenv("SIP_NO_REGISTER")) {
+        printf("[sip] SIP_NO_REGISTER -> 点对点模式，跳过 REGISTER\n");
+        set_state(SIP_ONLINE);
+        try_autocall_once();
+    } else {
+        send_register();
+    }
 }
 
 void app_sip_stop(void)
