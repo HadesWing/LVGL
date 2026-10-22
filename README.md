@@ -230,6 +230,8 @@ make debug                  # 开断言跑，查越界/野指针
 | 7 | `make build` 报 `C compiler is not able to compile a simple test program`，没有任何其它信息 | make 拉起的子进程 PATH 不完整时，**gcc 找不到 cc1/as 会静默失败** | Makefile 只做转发，真正构建放到 `scripts/dev.sh` 里、在 MSYS2 环境中执行 |
 | 8 | 编译全过，链接必失败：`cannot open output file C:\...\????\...\main.exe` | 工程在中文目录（`...\面试\...`）下，cmake 生成链接命令要过 `cmd.exe`，中文在非 UTF-8 代码页被替换成 `?`；编译那几步是 ninja 直连 gcc，所以只有链接挂 | `dev.sh` 自动建 ASCII 目录联接 `C:\lvgl_dev` → 工程，所有路径变成 `C:/lvgl_dev/...` |
 | 9 | 控制台里 `printf` 的中文全是乱码 | 源码是 UTF-8，Windows 控制台默认代码页 936(GBK) | `main()` 开头 `SetConsoleOutputCP(CP_UTF8)` |
+| 10 | VSCode 终端提示符明明写着 `MINGW64`，`make` 却 `command not found` | 那其实是 **Git Bash**（Git for Windows 的提示符也叫 MINGW64，极易认错），不是 MSYS2；Git Bash 里没有 make | 把 `C:\msys64\mingw64\bin\make.exe` 拷一份到 `Git\usr\bin\make.exe`；`dev.sh` 已做双宿主兼容（Git Bash 的 `/etc/profile` 会重置 PATH，绕过不 source） |
+| 11 | 从 Git Bash 走 make，链接报 `Cannot create temporary file in C:\Windows\: Permission denied` | TMP 环境变量在 Git Bash → make → msys2 bash 链路上丢了，链接器退回 C:\Windows 建临时文件 | `dev.sh` 里 `export TMP=$(cygpath -w /tmp)` 归一化 |
 
 > 第 6 条排查口诀：`ldd main.exe` 看依赖 → 程序目录优先于 PATH → 要么自带 DLL，要么静态链接（`-static`）。
 > 第 7、8 条是同一类问题：**Windows 上构建失败的根因经常不在代码，而在"谁替你启动了编译器"**。

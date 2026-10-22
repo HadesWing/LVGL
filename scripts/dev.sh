@@ -14,10 +14,19 @@ set -e
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---------- 进入 MSYS2 工具链环境（Windows） ----------
+# 注意：VSCode 里常见的 "MINGW64" 提示符终端可能是 Git Bash（Git for Windows），
+#       不是 MSYS2！两者 uname 都是 *MSYS* 系，但 Git Bash 的 /etc/profile 会把
+#       PATH 重置成 Git 自己的一套，把 msys2 的 cmake/ninja 挤掉。
+#       所以：只有真 MSYS2 才 source /etc/profile，工具链路径最后统一前置。
 if [ -d /c/msys64 ]; then
     export MSYSTEM=${MSYSTEM:-MINGW64}
+    if uname -s | grep -q '^MSYS_NT'; then
+        if [ -f /etc/profile ]; then source /etc/profile >/dev/null 2>&1 || true; fi
+    fi
     export PATH="/c/msys64/usr/bin:/c/msys64/mingw64/bin:$PATH"
-    if [ -f /etc/profile ]; then source /etc/profile >/dev/null 2>&1 || true; fi
+    # 归一化临时目录：从 Git Bash 链路传下来的 TMP 可能是 POSIX 路径或被丢掉，
+    # 链接器就会跑去 C:\Windows 建临时文件，报 "Permission denied"
+    export TMP="$(cygpath -w /tmp)" TEMP="$(cygpath -w /tmp)"
 fi
 
 # ---------- 避开中文路径（Windows 专属坑，必须处理） ----------
