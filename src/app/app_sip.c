@@ -12,6 +12,8 @@
  */
 #include "app_sip.h"
 #include "app_events.h"
+#include "app_audio.h"
+#include "g711.h"
 #include "sip_md5.h"
 
 #include <stdio.h>
@@ -88,14 +90,34 @@ typedef struct {
     char        peer[64];       /* 对端显示名/号码（UI 来电显示） */
     char        peer_uri[128];  /* 对端 URI（ACK/BYE 目标） */
     int         cseq;
+    char        invite_branch[64]; /* CANCEL 必须复用 INVITE 的 branch */
+    int         invite_cseq;
+    bool        cancelled;         /* 已发 CANCEL，等 487 回来 ACK 之后再清对话 */
+    uint64_t    t_cancel_ms;
     uint16_t    rtp_local;
     uint16_t    rtp_remote;
+    uint8_t     payload;        /* 8=PCMA / 0=PCMU（按 SDP 协商结果） */
     char        remote_ip[64];
     uint64_t    t_answer_ms;
+    uint64_t    t_start_ms;
 } sip_call_t;
 
 static sip_call_t s_call;
 static uint32_t s_rtp_rx, s_rtp_tx;
+
+/* --- RTP 发送侧状态 --- */
+static uint16_t s_rtp_seq;
+static uint32_t s_rtp_ts;
+static uint32_t s_rtp_ssrc;
+static uint64_t s_next_frame_ms;  /* 下一帧的发送时刻（按墙上时钟补帧，防欠载） */
+static bool     s_rtp_echo;      /* 无声卡时（CI）用回声验证媒体通路 */
+
+static void rtp_send_frame(int tone, const int16_t *sine8, int *phase);
+
+/* --- 注册 --- */
+static int      s_expires = 3600;
+static uint64_t s_last_register_ms;
+static bool     s_reg_pending;   /* 有一个 REGISTER 事务在飞（区分注册响应/呼叫响应） */
 
 static uint64_t now_ms(void)
 {
@@ -222,6 +244,38 @@ static void rtp_close(void)
 }
 
 /*---------------------------------------------------------------------------
+ * 媒体开关
+ *   起：初始化 RTP 序号/时间戳，尝试打开声卡；打不开就进"回声模式"
+ *       （无麦克风的 CI 环境里，靠原样回送证明双向通路是通的）
+ *   停：关声卡，清计数
+ *---------------------------------------------------------------------------*/
+static void rtp_start_media(void)
+{
+    rtp_open();
+    s_rtp_seq  = (uint16_t)(rand() & 0x7fff);
+    s_rtp_ts   = (uint32_t)rand();
+    s_rtp_ssrc = (uint32_t)rand();
+    s_rtp_rx = s_rtp_tx = 0;
+
+    /* SIP_RTP_ECHO=1 时强制回声（CI/无声卡环境验证媒体通路用），否则尝试开声卡 */
+    if (getenv("SIP_RTP_ECHO")) {
+        s_rtp_echo = true;
+    } else {
+        s_rtp_echo = !app_audio_open();
+    }
+    printf("[rtp] media start: %s:%u pt=%u mode=%s\n",
+           s_call.remote_ip, s_call.rtp_remote, s_call.payload,
+           s_rtp_echo ? "echo(无声卡)" : "audio");
+    fflush(stdout);
+}
+
+static void rtp_stop_media(void)
+{
+    app_audio_close();
+    s_rtp_echo = false;
+}
+
+/*---------------------------------------------------------------------------
  * SDP：只谈一路 PCMA/8000（与海思/大华门口机一致）
  *---------------------------------------------------------------------------*/
 static int build_sdp(char *out, size_t sz)
@@ -238,14 +292,21 @@ static int build_sdp(char *out, size_t sz)
         (unsigned)rand(), s_local_ip, s_local_ip, s_call.rtp_local);
 }
 
-/* 字段扫描取音频端口与对端 IP（避免引入 sdp_message 的额外解析层级） */
-static void parse_remote_sdp(const char *sdp, uint16_t *port, char *ip, size_t ipsz)
+/* 字段扫描取音频端口/IP/payload（避免引入 sdp_message 的额外解析层级） */
+static void parse_remote_sdp(const char *sdp, uint16_t *port, char *ip, size_t ipsz,
+                             uint8_t *payload)
 {
     if (!sdp) return;
     const char *m = strstr(sdp, "m=audio ");
     if (m && port) {
         int p = atoi(m + 8);
         if (p > 0) *port = (uint16_t)p;
+        /* m=audio 4000 RTP/AVP 8  → 取编码号，0=PCMU 8=PCMA */
+        const char *avp = strstr(m, "RTP/AVP ");
+        if (avp && payload) {
+            int pt = atoi(avp + 8);
+            if (pt == 0 || pt == 8) *payload = (uint8_t)pt;
+        }
     }
     const char *c = strstr(sdp, "c=IN IP4 ");
     if (c && ip) {
@@ -292,7 +353,8 @@ static void build_register(osip_message_t **out, const char *authorization)
     snprintf(buf, sizeof(buf), "<sip:%s@%s:%u>", s_cfg.user, s_local_ip, s_cfg.local_port);
     osip_message_set_contact(msg, buf);
     osip_message_set_max_forwards(msg, "70");
-    osip_message_set_expires(msg, "3600");
+    snprintf(buf, sizeof(buf), "%d", s_expires);
+    osip_message_set_expires(msg, buf);
     osip_message_set_content_length(msg, "0");
 
     if (authorization && *authorization)
@@ -319,8 +381,13 @@ static void build_invite(osip_message_t **out)
     osip_uri_parse(uri, s_call.peer_uri);
     osip_message_set_uri(msg, uri);
 
-    snprintf(buf, sizeof(buf), "SIP/2.0/UDP %s:%u;branch=z9hG4bK%u;rport",
-             s_local_ip, s_cfg.local_port, (unsigned)(s_call.cseq * 104729 + 7));
+    /* CANCEL 必须复用同一个 branch 与同一个 CSeq 号（只换方法名），
+       否则服务器认为它取消的是另一笔事务 —— 这是呼出取消失败最常见的原因 */
+    s_call.invite_cseq = s_call.cseq;
+    snprintf(s_call.invite_branch, sizeof(s_call.invite_branch), "z9hG4bK%u",
+             (unsigned)(s_call.cseq * 104729 + 7));
+    snprintf(buf, sizeof(buf), "SIP/2.0/UDP %s:%u;branch=%s;rport",
+             s_local_ip, s_cfg.local_port, s_call.invite_branch);
     osip_message_set_via(msg, buf);
 
     snprintf(buf, sizeof(buf), "<sip:%s@%s>;tag=%s", s_cfg.user, s_local_ip, s_call.local_tag);
@@ -526,7 +593,9 @@ static void send_register(void)
     osip_message_t *msg = NULL;
     build_register(&msg, NULL);
     if (msg) {
-        set_state(SIP_REGISTERING);
+        /* 续期（通话中）不能改状态，否则来电/通话中的界面会被打回"在线" */
+        if (s_state == SIP_IDLE || s_state == SIP_ERROR) set_state(SIP_REGISTERING);
+        s_reg_pending = true;
         if (send_msg(msg) == 0) printf("[sip] REGISTER sent (cseq=%d)\n", s_cseq - 1);
         osip_message_free(msg);
     }
@@ -544,7 +613,8 @@ static void send_register_authed(void)
     }
     build_register(&msg, auth);
     if (msg) {
-        set_state(SIP_REGISTERING);
+        if (s_state == SIP_IDLE || s_state == SIP_ERROR) set_state(SIP_REGISTERING);
+        s_reg_pending = true;
         if (send_msg(msg) == 0) printf("[sip] REGISTER(auth) sent\n");
         osip_message_free(msg);
     }
@@ -559,6 +629,7 @@ static void call_reset(void)
     s_call.active = false;
     s_call.answered = false;
     s_call.outgoing = false;
+    s_call.cancelled = false;
     s_call.t_answer_ms = 0;
 }
 
@@ -576,6 +647,10 @@ int app_sip_call(const char *target)
     s_call.active = true;
     s_call.outgoing = true;
     s_call.cseq = 1;
+    s_call.payload = 8;                  /* 默认 PCMA，最终以对端应答的 SDP 为准 */
+    s_call.rtp_remote = 0;
+    s_call.remote_ip[0] = '\0';
+    s_call.t_start_ms = now_ms();
     snprintf(s_call.local_tag, sizeof(s_call.local_tag), "ind%u", (unsigned)(now_ms() & 0xffffff));
     snprintf(s_call.h.call_id, sizeof(s_call.h.call_id), "%08x%08x@%s",
              (unsigned)rand(), (unsigned)rand(), s_local_ip);
@@ -608,8 +683,9 @@ int app_sip_answer(void)
     build_sdp(sdp, sizeof(sdp));
     send_reply(&s_call.h, 200, "OK", NULL, sdp);
     s_call.answered = true;
-    s_call.t_answer_ms = now_ms();
     set_state(SIP_INCALL);
+    rtp_start_media();               /* 200 OK 一发出，媒体就该通了 */
+    s_call.t_answer_ms = now_ms();   /* 同上：音频初始化不计入通话时长 */
     return 0;
 }
 
@@ -637,9 +713,38 @@ int app_sip_hangup(void)
         fflush(stdout);
         send_raw(buf, strlen(buf), &s_call.h.peer_addr);
     } else if (s_state == SIP_RINGING) {
-        printf("[sip] cancel outgoing call\n");
+        /* 呼出中挂断 = CANCEL：必须复用 INVITE 的 branch 与 CSeq 号，
+           否则服务器认为取消的是另一笔事务，对端会一直响到超时 */
+        char buf[1024];
+        snprintf(buf, sizeof(buf),
+            "CANCEL %s SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP %s:%u;branch=%s;rport\r\n"
+            "From: <sip:%s@%s>;tag=%s\r\n"
+            "To: <%s>\r\n"
+            "Call-ID: %s\r\n"
+            "CSeq: %d CANCEL\r\n"
+            "Max-Forwards: 70\r\n"
+            "Content-Length: 0\r\n\r\n",
+            s_call.peer_uri, s_local_ip, s_cfg.local_port, s_call.invite_branch,
+            s_cfg.user, s_local_ip, s_call.local_tag, s_call.peer_uri,
+            s_call.h.call_id, s_call.invite_cseq);
+        printf("[sip] >> CANCEL (cseq=%d branch=%s)\n", s_call.invite_cseq, s_call.invite_branch);
         fflush(stdout);
+        send_raw(buf, strlen(buf), NULL);   /* 走代理 */
+
+        /* 关键：**不能立刻 call_reset**。487 回来后还要按 RFC 回一个 ACK，
+           那时需要 branch / CSeq / Call-ID。所以只把"已取消"标记挂上，
+           等 487 处理完再清对话（超时 5s 兜底，见 recv_loop）。 */
+        s_call.cancelled = true;
+        s_call.t_cancel_ms = now_ms();
+        idle_state();
+        return 0;
     }
+    printf("[rtp] stats rx=%u tx=%u dur=%ds (pps=%.1f)\n", s_rtp_rx, s_rtp_tx,
+           app_sip_call_seconds(),
+           app_sip_call_seconds() > 0 ? (double)s_rtp_tx / app_sip_call_seconds() : 0.0);
+    fflush(stdout);
+    rtp_stop_media();
     call_reset();
     s_rtp_rx = s_rtp_tx = 0;
     idle_state();
@@ -656,18 +761,27 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
     fflush(stdout);
 
     /* --- 注册 --- */
-    if (s_state == SIP_REGISTERING && code == 200) {
+    if (s_reg_pending && code == 200) {
+        s_reg_pending = false;
         s_registered = true;
-        set_state(SIP_ONLINE);
+        s_last_register_ms = now_ms();
+        /* 通话/来电/呼出中收到的是"续期"响应，不能把界面状态打回"在线" */
+        if (s_state != SIP_INCALL && s_state != SIP_INCOMING && s_state != SIP_RINGING)
+            set_state(SIP_ONLINE);
+        printf("[sip] registered (expires=%d)\n", s_expires);
+        fflush(stdout);
         /* 自测用：注册成功后自动呼出（SIP_AUTOCALL=1002） */
         {
             static int autocall_done = 0;
             const char *ac = getenv("SIP_AUTOCALL");
-            if (ac && *ac && !autocall_done) { autocall_done = 1; app_sip_call(ac); }
+            if (ac && *ac && !autocall_done && s_state == SIP_ONLINE) {
+                autocall_done = 1;
+                app_sip_call(ac);
+            }
         }
         return;
     }
-    if (s_state == SIP_REGISTERING && (code == 401 || code == 407)) {
+    if (s_reg_pending && (code == 401 || code == 407)) {
         osip_www_authenticate_t *wa = NULL;
         osip_message_get_www_authenticate(msg, 0, &wa);
         if (!wa) osip_message_get_proxy_authenticate(msg, 0, &wa);
@@ -730,11 +844,12 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
         else
             snprintf(to_line, sizeof(to_line), "<%s>;tag=%s", s_call.peer_uri, to_tag);
 
-        /* 对端 SDP：媒体目标以应答为准 */
+        /* 对端 SDP：媒体目标与编码以应答为准（应答方说了算） */
         osip_body_t *body = NULL;
         if (osip_message_get_body(msg, 0, &body) == 0 && body && body->body)
             parse_remote_sdp(body->body, &s_call.rtp_remote,
-                             s_call.remote_ip, sizeof(s_call.remote_ip));
+                             s_call.remote_ip, sizeof(s_call.remote_ip),
+                             &s_call.payload);
 
         /* 注意：2xx 的 ACK 必须用与 INVITE **相同**的 CSeq 号，不能自增，
            否则服务器/UAS 认为 ACK 匹配不上，会一直重传 200 OK（实测踩到） */
@@ -756,15 +871,48 @@ static void handle_response(osip_message_t *msg, struct sockaddr_in *from)
         fflush(stdout);
         send_raw(buf, strlen(buf), &s_call.h.peer_addr);
 
-        rtp_open();
         s_call.answered = true;
-        s_call.t_answer_ms = now_ms();
         set_state(SIP_INCALL);
+        rtp_start_media();               /* 收到 200 OK + ACK，媒体通路开起来 */
+        /* 计时起点放在音频初始化之后：Windows WASAPI 首次打开设备可能耗 1~3s，
+           若先计时会把"开声卡的耗时"算成通话时长（实测踩到，AUTOHANGUP 秒触发） */
+        s_call.t_answer_ms = now_ms();
         return;
     }
     if (code >= 300) {
         printf("[sip] call failed %d\n", code);
         fflush(stdout);
+
+        /* RFC 3261 §17.1.1.3：INVITE 的**非 2xx 终态响应也必须 ACK**，
+           否则 UAS/代理会按事务重传定时器一直重发这个响应（实测刷屏）。
+           这个 ACK 属于 INVITE 事务本身：同 branch、同 CSeq，Request-URI 用 INVITE 的。 */
+        if (s_call.active && s_call.outgoing) {
+            char ack[1024], to[352];
+            char *ts = NULL;
+            if (msg->to && osip_to_to_str(msg->to, &ts) == 0 && ts) {
+                safe_str(to, sizeof(to), ts);
+                osip_free(ts);
+            } else {
+                snprintf(to, sizeof(to), "<%s>", s_call.peer_uri);
+            }
+            snprintf(ack, sizeof(ack),
+                "ACK %s SIP/2.0\r\n"
+                "Via: SIP/2.0/UDP %s:%u;branch=%s;rport\r\n"
+                "From: <sip:%s@%s>;tag=%s\r\n"
+                "To: %s\r\n"
+                "Call-ID: %s\r\n"
+                "CSeq: %d ACK\r\n"
+                "Max-Forwards: 70\r\n"
+                "Content-Length: 0\r\n\r\n",
+                s_call.peer_uri, s_local_ip, s_cfg.local_port, s_call.invite_branch,
+                s_cfg.user, s_local_ip, s_call.local_tag, to,
+                s_call.h.call_id, s_call.invite_cseq);
+            printf("[sip] >> ACK(非2xx响应)\n");
+            fflush(stdout);
+            send_raw(ack, strlen(ack), from);
+        }
+
+        rtp_stop_media();
         call_reset();
         idle_state();
     }
@@ -804,7 +952,8 @@ static void handle_request(osip_message_t *msg, struct sockaddr_in *from)
         osip_body_t *body = NULL;
         if (osip_message_get_body(msg, 0, &body) == 0 && body && body->body)
             parse_remote_sdp(body->body, &s_call.rtp_remote,
-                             s_call.remote_ip, sizeof(s_call.remote_ip));
+                             s_call.remote_ip, sizeof(s_call.remote_ip),
+                             &s_call.payload);
         if (!s_call.remote_ip[0])
             safe_str(s_call.remote_ip, sizeof(s_call.remote_ip), inet_ntoa(from->sin_addr));
 
@@ -825,7 +974,9 @@ static void handle_request(osip_message_t *msg, struct sockaddr_in *from)
         capture_request(msg, from, &h);
         send_reply(&h, 200, "OK", NULL, NULL);
         printf("[sip] call ended by peer\n");
+        printf("[rtp] stats rx=%u tx=%u dur=%ds\n", s_rtp_rx, s_rtp_tx, app_sip_call_seconds());
         fflush(stdout);
+        rtp_stop_media();
         call_reset();
         s_rtp_rx = s_rtp_tx = 0;
         idle_state();
@@ -844,27 +995,139 @@ static void handle_request(osip_message_t *msg, struct sockaddr_in *from)
     if (strcmp(method, "CANCEL") == 0) {
         sip_hdrs_t h;
         capture_request(msg, from, &h);
-        send_reply(&h, 200, "OK", NULL, NULL);
-        send_reply(&s_call.h, 487, "Request Terminated", NULL, NULL);
+        send_reply(&h, 200, "OK", NULL, NULL);          /* 先确认 CANCEL 本身 */
+        send_reply(&s_call.h, 487, "Request Terminated", NULL, NULL); /* 再终结 INVITE */
+        printf("[sip] incoming call cancelled by peer\n");
+        fflush(stdout);
+        rtp_stop_media();
         call_reset();
         idle_state();
         return;
     }
 }
 
-/* RTP：收到就原样回送（回声），无板时验证双向媒体 */
+/*---------------------------------------------------------------------------
+ * RTP 媒体收：解 G.711 → 播放环
+ *   如果声卡打不开（CI/无声卡），退回"收到就原样回送"，用回声证明双向通路通
+ *---------------------------------------------------------------------------*/
 static void rtp_on_readable(void)
 {
-    static unsigned char buf[1600];
+    static uint8_t buf[1600];
     struct sockaddr_in from;
     int fromlen = sizeof(from);
     int n = (int)recvfrom(s_rtp, (char *)buf, sizeof(buf), 0,
                           (struct sockaddr *)&from, &fromlen);
-    if (n <= 0) return;
+    if (n <= 12) return;
     s_rtp_rx++;
-    if (n > 12) {          /* 12 字节 RTP 头之后的负载原样回送 */
+
+    if (s_rtp_echo) {
         sendto(s_rtp, (const char *)buf, n, 0, (struct sockaddr *)&from, fromlen);
         s_rtp_tx++;
+        return;
+    }
+
+    const uint8_t *payload = buf + 12;
+    int plen = n - 12;
+    /* RTP 扩展头（X 位）极少出现在语音里，但出现了必须跳过，
+       否则把扩展数据当语音解码 → 刺啦声 */
+    if (buf[0] & 0x10) {
+        if (plen < 4) return;
+        int ext_words = (payload[2] << 8) | payload[3];
+        int skip = 4 + ext_words * 4;
+        if (skip >= plen) return;
+        payload += skip;
+        plen -= skip;
+    }
+    if (plen > G711_FRAME_SAMPLES * 2) plen = G711_FRAME_SAMPLES * 2;
+
+    static int16_t pcm[G711_FRAME_SAMPLES * 2];
+    if (s_call.payload == 0) g711_decode_ulaw(payload, pcm, plen);
+    else                     g711_decode_alaw(payload, pcm, plen);
+    app_audio_write(pcm, plen);
+}
+
+/*---------------------------------------------------------------------------
+ * RTP 媒体发：每 20ms 一帧 160 采样（G.711 固定 64kbps）
+ *   节奏由 recv_loop 的 select 超时驱动（呼叫中 20ms 一次），
+ *   没有麦克风数据时补静音 —— 保持稳定的包间隔，避免对端抖动缓冲"饿死"
+ *---------------------------------------------------------------------------*/
+static void rtp_tx_tick(void)
+{
+    /* 自测音源：1kHz 正弦（8kHz 采样下一个周期正好 8 个点，用查表免掉 math.h）。
+       用途：没有麦克风的工控机/CI 上验证"编码→RTP→解码"整条链路；
+       板子上也可以拿它做对讲自检（喇叭里应听到"嘟——"）。 */
+    static const int16_t sine8[8] = { 0, 11585, 16384, 11585, 0, -11585, -16384, -11585 };
+    static int sine_phase;
+    static int tone = -1;
+    if (tone < 0) tone = getenv("SIP_TONE") ? 1 : 0;
+
+    if (s_state != SIP_INCALL || !s_call.answered) { s_next_frame_ms = 0; return; }
+    if (s_rtp_echo || s_rtp == SOCK_INVALID || s_call.rtp_remote == 0) { s_next_frame_ms = 0; return; }
+    if (!tone && !app_audio_can_record()) { s_next_frame_ms = 0; return; }
+
+    /* 按"墙上时钟"补帧：一次 tick 里把落后的帧补齐（最多 3 帧），
+       否则 select 每轮 33ms 就只能发 1 帧 → 32kbps 而不是 64kbps，
+       对端播放缓冲会被慢慢抽干（实测 underrun 290 次）。 */
+    uint64_t now = now_ms();
+    if (s_next_frame_ms == 0) s_next_frame_ms = now;
+    if (s_next_frame_ms > now + 500) s_next_frame_ms = now;   /* 时钟跳变保护 */
+
+    int sent = 0;
+    while (s_next_frame_ms <= now && sent < 3) {
+        rtp_send_frame(tone, sine8, &sine_phase);
+        s_next_frame_ms += 20;
+        sent++;
+    }
+    if (sent == 0 && s_next_frame_ms < now && (int64_t)(now - s_next_frame_ms) > 1000)
+        s_next_frame_ms = now;   /* 长时间没发（切网/挂起），直接对齐，不要一次补几百帧 */
+}
+
+/* 发一帧 20ms，编码按协商的 payload（8=PCMA / 0=PCMU） */
+static void rtp_send_frame(int tone, const int16_t *sine8, int *phase)
+{
+    uint8_t pkt[12 + G711_FRAME_SAMPLES];
+    int16_t pcm[G711_FRAME_SAMPLES];
+
+    int got = 0;
+    if (tone) {
+        for (int i = 0; i < G711_FRAME_SAMPLES; i++) {
+            pcm[i] = sine8[*phase & 7];
+            (*phase)++;
+        }
+        got = G711_FRAME_SAMPLES;
+    } else {
+        got = app_audio_read(pcm, G711_FRAME_SAMPLES);
+    }
+    if (got < G711_FRAME_SAMPLES)
+        memset(pcm + got, 0, (size_t)(G711_FRAME_SAMPLES - got) * sizeof(int16_t));
+
+    pkt[0]  = 0x80;                       /* V=2 */
+    pkt[1]  = s_call.payload;             /* 8=PCMA / 0=PCMU，M 位为 0 */
+    pkt[2]  = (uint8_t)(s_rtp_seq >> 8);
+    pkt[3]  = (uint8_t)(s_rtp_seq & 0xFF);
+    pkt[4]  = (uint8_t)(s_rtp_ts >> 24);
+    pkt[5]  = (uint8_t)(s_rtp_ts >> 16);
+    pkt[6]  = (uint8_t)(s_rtp_ts >> 8);
+    pkt[7]  = (uint8_t)(s_rtp_ts);
+    pkt[8]  = (uint8_t)(s_rtp_ssrc >> 24);
+    pkt[9]  = (uint8_t)(s_rtp_ssrc >> 16);
+    pkt[10] = (uint8_t)(s_rtp_ssrc >> 8);
+    pkt[11] = (uint8_t)(s_rtp_ssrc);
+
+    if (s_call.payload == 0) g711_encode_ulaw(pcm, pkt + 12, G711_FRAME_SAMPLES);
+    else                     g711_encode_alaw(pcm, pkt + 12, G711_FRAME_SAMPLES);
+
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port   = htons(s_call.rtp_remote);
+    to.sin_addr.s_addr = inet_addr(s_call.remote_ip[0] ? s_call.remote_ip : "127.0.0.1");
+
+    if (sendto(s_rtp, (const char *)pkt, sizeof(pkt), 0,
+               (const struct sockaddr *)&to, sizeof(to)) > 0) {
+        s_rtp_tx++;
+        s_rtp_seq++;
+        s_rtp_ts += G711_FRAME_SAMPLES;
     }
 }
 
@@ -878,18 +1141,43 @@ static void *recv_loop(void *arg)
         sock_t maxfd = s_sock;
         if (s_rtp != SOCK_INVALID) { FD_SET(s_rtp, &rfds); if (s_rtp > maxfd) maxfd = s_rtp; }
 
-        struct timeval tv = { 0, 200000 };   /* 200ms，便于退出 */
-        if (select((int)maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+        /* 呼叫中 20ms 一次（RTP 帧节奏），空闲时 100ms 足够 —— 既不空转 CPU，
+           又能保证音频包间隔稳定（用 200ms 会在两帧之间攒出抖动） */
+        struct timeval tv = (s_state == SIP_INCALL) ? (struct timeval){ 0, 20000 }
+                                                    : (struct timeval){ 0, 100000 };
+        int sel = select((int)maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (sel <= 0) {
+            rtp_tx_tick();
+            /* CANCEL 发出后 5s 还没等到 487：清对话兜底，避免一直占线 */
+            if (s_call.cancelled && (now_ms() - s_call.t_cancel_ms) > 5000) {
+                printf("[sip] CANCEL 未收到 487，强制清理\n");
+                fflush(stdout);
+                call_reset();
+            }
+            /* 注册续期：Expires 一半时重发 REGISTER（真实服务器会踢掉过期账号） */
+            if (s_registered && s_expires > 0 &&
+                (now_ms() - s_last_register_ms) > (uint64_t)(s_expires / 2) * 1000u) {
+                s_auth_tried = 0;
+                send_register();
+            }
             /* 自测用：SIP_AUTOHANGUP=<秒> 通话 N 秒后自动挂断 */
             static int hang_s = -1;
             if (hang_s < 0) {
                 const char *v = getenv("SIP_AUTOHANGUP");
                 hang_s = (v && *v) ? atoi(v) : 0;
             }
-            if (hang_s > 0 && s_state == SIP_INCALL && app_sip_call_seconds() >= hang_s)
-                app_sip_hangup();
+            if (hang_s > 0 &&
+                (s_state == SIP_INCALL || s_state == SIP_RINGING)) {
+                int secs = (s_state == SIP_INCALL)
+                         ? app_sip_call_seconds()
+                         : (int)((now_ms() - s_call.t_start_ms) / 1000u);
+                if (secs >= hang_s) app_sip_hangup();
+            }
             continue;
         }
+
+        /* 有包也要看看是不是该发音频了（20ms 节奏不能只靠超时分支） */
+        rtp_tx_tick();
 
         if (s_rtp != SOCK_INVALID && FD_ISSET(s_rtp, &rfds)) rtp_on_readable();
         if (!FD_ISSET(s_sock, &rfds)) continue;
@@ -939,6 +1227,10 @@ bool app_sip_init_from_env(void)
     s_cfg.user        = getenv("SIP_USER") ? getenv("SIP_USER") : "1001";
     s_cfg.pass        = getenv("SIP_PASS") ? getenv("SIP_PASS") : "";
     s_cfg.local_port  = (uint16_t)atoi(getenv("SIP_LOCAL_PORT") ? getenv("SIP_LOCAL_PORT") : "5062");
+    s_expires         = getenv("SIP_EXPIRES") ? atoi(getenv("SIP_EXPIRES")) : 3600;
+    if (s_expires < 60) s_expires = 60;      /* 太快会被服务器当泛洪 */
+    /* 强迫回声模式（CI 无麦克风时用，验证媒体双向通路而不依赖声卡） */
+    s_rtp_echo = getenv("SIP_RTP_ECHO") != NULL;
     srand((unsigned)time(NULL));
     snprintf(s_regid, sizeof(s_regid), "indoor-%u@%s", (unsigned)rand(), s_local_ip);
     printf("[sip] cfg: %s:%u user=%s local=%u\n",

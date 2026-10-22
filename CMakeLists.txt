@@ -91,6 +91,11 @@ target_include_directories(lvgl PUBLIC ${PROJECT_SOURCE_DIR} ${SDL2_INCLUDE_DIRS
 set(LVGL_HAL "sdl" CACHE STRING "HAL backend: sdl | fbdev")
 
 set(MAIN_SOURCES src/mouse_cursor_icon.c
+                 src/ui/fonts/ui_font_cjk_16.c
+                 src/ui/fonts/ui_font_cjk_24.c
+                 src/oem/oem.c
+                 src/oem/oem_default.c
+                 src/oem/oem_alt.c
                  src/ui/ui_theme.c
                  src/ui/ui_common.c
                  src/ui/ui_nav.c
@@ -101,6 +106,8 @@ set(MAIN_SOURCES src/mouse_cursor_icon.c
                  src/app/app_events.c
                  src/app/app_devices.c
                  src/app/app_stats.c
+                 src/app/app_audio.c
+                 src/app/g711.c
                  src/app/app_mock.c)
 
 if(LVGL_HAL STREQUAL "fbdev")
@@ -232,6 +239,7 @@ target_include_directories(main PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/src/ui
     ${PROJECT_SOURCE_DIR}/src/app
+    ${PROJECT_SOURCE_DIR}/src/oem
     ${PROJECT_SOURCE_DIR}/src/hal)
 target_compile_definitions(main PRIVATE LV_CONF_INCLUDE_SIMPLE)
 if(APP_WITH_SIP)

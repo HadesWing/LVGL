@@ -9,6 +9,8 @@
  *   - 语义色（成功绿/危险红）不随主题变 —— 用户对"绿=接听"的认知不能因为夜间模式改变。
  */
 #include "ui_theme.h"
+#include "ui_common.h"   /* FONT_CJK / FONT_CJK_LG */
+#include "oem.h"
 
 /*---------------------------------------------------------------------------
  * 样式对象实体定义（头文件里只做 extern 声明，实体在这里，全局唯一一份）
@@ -37,34 +39,38 @@ typedef struct {
     uint32_t text;      /* 主文字 */
     uint32_t text_muted;/* 次要文字 */
     uint32_t border;    /* 分隔/描边 */
+    uint32_t ok;        /* 语义色：接听 */
+    uint32_t danger;    /* 语义色：拒接 */
 } ui_palette_t;
 
-static const ui_palette_t s_palettes[2] = {
-    [UI_THEME_LIGHT] = {
-        .bg         = 0xECEFF1,
-        .surface    = 0x37474F,
-        .card       = 0xFFFFFF,
-        .bar        = 0x263238,
-        .bar_text   = 0xFFFFFF,
-        .text       = 0x263238,
-        .text_muted = 0x607D8B,
-        .border     = 0xCFD8DC,
-    },
-    [UI_THEME_DARK] = {
-        .bg         = 0x121212,
-        .surface    = 0x1E1E1E,
-        .card       = 0x263238,
-        .bar        = 0x000000,
-        .bar_text   = 0xE0E0E0,
-        .text       = 0xE0E0E0,
-        .text_muted = 0x9E9E9E,
-        .border     = 0x333333,
-    },
-};
-
-/* 语义色（不随主题变化） */
-#define COLOR_OK      0x2E7D32   /* 接听 / 成功 */
-#define COLOR_DANGER  0xC62828   /* 拒接 / 危险 */
+/* 浅色 = 完全来自 OEM profile（客户改 ini 就换色）；
+   深色 = 程序推导（只保留品牌主色），OEM 不必给两套色板 —— 少一半配置量。 */
+static void get_palette(ui_theme_t theme, ui_palette_t *p)
+{
+    if (theme == UI_THEME_LIGHT) {
+        p->bg         = oem_color(OEM_COLOR_BG);
+        p->surface    = oem_color(OEM_COLOR_SURFACE);
+        p->card       = oem_color(OEM_COLOR_CARD);
+        p->bar        = oem_color(OEM_COLOR_BAR);
+        p->bar_text   = oem_color(OEM_COLOR_BAR_TEXT);
+        p->text       = oem_color(OEM_COLOR_TEXT);
+        p->text_muted = oem_color(OEM_COLOR_TEXT_MUTED);
+        p->border     = oem_color(OEM_COLOR_BORDER);
+        p->ok         = oem_color(OEM_COLOR_OK);
+        p->danger     = oem_color(OEM_COLOR_DANGER);
+    } else {
+        p->bg         = 0x121212;
+        p->surface    = 0x1E1E1E;
+        p->card       = 0x263238;
+        p->bar        = 0x000000;
+        p->bar_text   = 0xE0E0E0;
+        p->text       = 0xE0E0E0;
+        p->text_muted = 0x9E9E9E;
+        p->border     = 0x333333;
+        p->ok         = oem_color(OEM_COLOR_OK);
+        p->danger     = oem_color(OEM_COLOR_DANGER);
+    }
+}
 
 static ui_theme_t s_current = UI_THEME_LIGHT;
 static bool s_initialized = false;
@@ -74,7 +80,9 @@ static bool s_initialized = false;
  *---------------------------------------------------------------------------*/
 static void apply_palette(ui_theme_t theme)
 {
-    const ui_palette_t *p = &s_palettes[theme];
+    ui_palette_t pal;
+    get_palette(theme, &pal);
+    const ui_palette_t *p = &pal;
 
     lv_style_set_bg_color(&st_screen, lv_color_hex(p->bg));
 
@@ -92,6 +100,11 @@ static void apply_palette(ui_theme_t theme)
 
     lv_style_set_border_color(&st_btn_common, lv_color_hex(p->border));
 
+    /* 语义色也走调色板：客户若规定"接听键要品牌绿"，改 ini 即可 */
+    lv_style_set_bg_color(&st_btn_ok, lv_color_hex(p->ok));
+    lv_style_set_bg_color(&st_btn_danger, lv_color_hex(p->danger));
+    lv_style_set_border_color(&st_surface_calling, lv_color_hex(p->ok));
+
     /* 通知 LVGL：这些样式变了，凡是引用它们的对象都要重算样式 */
     lv_obj_report_style_change(&st_screen);
     lv_obj_report_style_change(&st_bar);
@@ -102,6 +115,8 @@ static void apply_palette(ui_theme_t theme)
     lv_obj_report_style_change(&st_text_muted);
     lv_obj_report_style_change(&st_title);
     lv_obj_report_style_change(&st_btn_common);
+    lv_obj_report_style_change(&st_btn_ok);
+    lv_obj_report_style_change(&st_btn_danger);
 }
 
 /*---------------------------------------------------------------------------
@@ -109,6 +124,10 @@ static void apply_palette(ui_theme_t theme)
  *---------------------------------------------------------------------------*/
 static void styles_init_once(void)
 {
+    /* 圆角/间距等"形状"取自 OEM：不同客户对"硬朗"还是"圆润"的要求差别很大，
+       但这属于换皮范畴，不该让 UI 代码去判断。 */
+    int radius = oem()->layout.radius;
+
     /* 屏幕：只负责底色 */
     lv_style_init(&st_screen);
 
@@ -125,32 +144,31 @@ static void styles_init_once(void)
 
     /* 卡片/视频区：圆角 + 细描边 */
     lv_style_init(&st_surface);
-    lv_style_set_radius(&st_surface, 8);
+    lv_style_set_radius(&st_surface, radius > 6 ? 8 : 2);
     lv_style_set_border_width(&st_surface, 1);
 
-    /* 通话中：绿边框 + 更亮描边（语义状态，用"换样式"而不是改属性） */
+    /* 通话中：绿边框（颜色在 apply_palette 里按 OEM 语义色设置） */
     lv_style_init(&st_surface_calling);
     lv_style_set_border_width(&st_surface_calling, 3);
-    lv_style_set_border_color(&st_surface_calling, lv_color_hex(COLOR_OK));
 
     /* 弹窗卡片：大圆角 + 阴影（阴影是"纸片感"的来源） */
     lv_style_init(&st_card);
-    lv_style_set_radius(&st_card, 12);
+    lv_style_set_radius(&st_card, radius);
     lv_style_set_border_width(&st_card, 0);
     lv_style_set_shadow_width(&st_card, 40);
     lv_style_set_shadow_opa(&st_card, LV_OPA_40);
 
-    /* 文字 */
+    /* 文字：统一用中文字库（子集里已包含 ASCII，不必再靠 Montserrat） */
     lv_style_init(&st_text_primary);
     lv_style_init(&st_text_muted);
-    lv_style_set_text_font(&st_text_muted, &lv_font_montserrat_14);
+    lv_style_set_text_font(&st_text_muted, FONT_CJK);
 
     lv_style_init(&st_title);
-    lv_style_set_text_font(&st_title, &lv_font_montserrat_16);
+    lv_style_set_text_font(&st_title, FONT_CJK_LG);
 
     /* 按钮公共部分 */
     lv_style_init(&st_btn_common);
-    lv_style_set_radius(&st_btn_common, 12);
+    lv_style_set_radius(&st_btn_common, radius > 12 ? 12 : radius);
     lv_style_set_border_width(&st_btn_common, 0);
     lv_style_set_shadow_width(&st_btn_common, 8);
     lv_style_set_shadow_opa(&st_btn_common, LV_OPA_20);
@@ -162,14 +180,11 @@ static void styles_init_once(void)
 
     /* 语义色 */
     lv_style_init(&st_btn_ok);
-    lv_style_set_bg_color(&st_btn_ok, lv_color_hex(COLOR_OK));
-
     lv_style_init(&st_btn_danger);
-    lv_style_set_bg_color(&st_btn_danger, lv_color_hex(COLOR_DANGER));
 
     lv_style_init(&st_btn_label);
     lv_style_set_text_color(&st_btn_label, lv_color_hex(0xFFFFFF));
-    lv_style_set_text_font(&st_btn_label, &lv_font_montserrat_14);
+    lv_style_set_text_font(&st_btn_label, FONT_CJK);
 }
 
 /*---------------------------------------------------------------------------

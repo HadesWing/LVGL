@@ -232,6 +232,10 @@ make debug                  # 开断言跑，查越界/野指针
 | 9 | 控制台里 `printf` 的中文全是乱码 | 源码是 UTF-8，Windows 控制台默认代码页 936(GBK) | `main()` 开头 `SetConsoleOutputCP(CP_UTF8)` |
 | 10 | VSCode 终端提示符明明写着 `MINGW64`，`make` 却 `command not found` | 那其实是 **Git Bash**（Git for Windows 的提示符也叫 MINGW64，极易认错），不是 MSYS2；Git Bash 里没有 make | 把 `C:\msys64\mingw64\bin\make.exe` 拷一份到 `Git\usr\bin\make.exe`；`dev.sh` 已做双宿主兼容（Git Bash 的 `/etc/profile` 会重置 PATH，绕过不 source） |
 | 11 | 从 Git Bash 走 make，链接报 `Cannot create temporary file in C:\Windows\: Permission denied` | TMP 环境变量在 Git Bash → make → msys2 bash 链路上丢了，链接器退回 C:\Windows 建临时文件 | `dev.sh` 里 `export TMP=$(cygpath -w /tmp)` 归一化 |
+| 12 | 界面中文显示成方框（"□光""空□""SIP 在□"） | LVGL 内置思源黑体只收了约 1500 常用字，`灯/调/风/插/线/备` 恰好不在里面 | `scripts/gen_font.py` 扫描源码文案生成**按需子集**，并关掉内置字库 |
+| 13 | 新字库编译通过，但屏幕上**一个字都画不出来**，日志刷 `Compressed fonts is used but LV_USE_FONT_COMPRESSED is not enabled` | lv_font_conv 默认输出 RLE 压缩字形，而 `lv_conf.h` 里解码开关是关的 | 开 `LV_USE_FONT_COMPRESSED`（更弱的 MCU 可用 `--no-compress` 重生成） |
+| 14 | 通话一接通就自动挂断，RTP 只发出去 1 个包 | Windows WASAPI 首次打开音频设备耗时 1~3s，被算进了通话时长（`t_answer_ms` 早于开声卡） | 计时起点挪到 `rtp_start_media()` **之后** |
+| 15 | 声音断续，播放欠载 400+ 次 | SDL 返回的是立体声设备，播放回调每 20ms 被要走 320 采样（单声道需求的两倍） | `SDL_OpenAudioDevice` 的 `allowed_changes` 传 0，强制 8k/单声道 |
 
 > 第 6 条排查口诀：`ldd main.exe` 看依赖 → 程序目录优先于 PATH → 要么自带 DLL，要么静态链接（`-static`）。
 > 第 7、8 条是同一类问题：**Windows 上构建失败的根因经常不在代码，而在"谁替你启动了编译器"**。
@@ -247,9 +251,36 @@ make debug                  # 开断言跑，查越界/野指针
 |---|---|---|
 | 智能家居中控台 UI | flex/grid 主页 + 设备九宫格 + 场景条 + 页面栈 | 真实设备协议（MQTT/RS485） |
 | 语音唤醒 + 指令理解 | **voice_engine 统一接口**：mock + **sherpa-onnx 免费离线引擎（真麦克风，现在就能调）**，意图解析 + 唤醒状态机全本机完成 | 换思必驰离线 SDK（板上量产主路径），接口不动 |
-| SIP 音视频对讲 | 呼叫状态机 + 来电横幅 + 对讲页，mock VTO 来电 | oSIP/eXosip 实装 + ALSA 音频 + 硬解视频 |
+| SIP 音视频对讲 | **oSIP 客户端全链路**（注册/认证/双向呼叫/取消/G.711 音频，真服务器实测）+ 对讲页 | ALSA 替换 SDL + H.264 硬解 + 板端 AEC |
 
 **里程碑**：M1 中控台骨架（flex/grid+设备模型+事件总线）→ M2 语音链路 → M3 SIP 对讲 → M4 中文字体+图标 → M5 量化压测 → M6 上板（fbdev/evdev/audio + 交叉编译）。
+
+## 多客户定制（OEM）
+
+> 详细操作见 [`docs/OEM定制指南.md`](docs/OEM定制指南.md)。
+
+室内机是白牌产品：同一套软硬件卖给不同客户，配色、文案、首页结构都不同。
+本工程把差异全部收进 `src/oem/`，UI 代码里**没有一个品牌字面量**：
+
+```c
+const oem_profile_t *o = oem();
+lv_label_set_text(title, oem_text(OEM_TXT_PRODUCT));      /* 文案 */
+lv_obj_set_style_text_color(icon, lv_color_hex(oem_color(OEM_COLOR_PRIMARY)), 0);  /* 颜色 */
+lv_obj_set_size(cell, o->layout.card_w, o->layout.card_h); /* 尺寸 */
+if (o->layout.home_style == OEM_HOME_LIST) build_list(...); /* 结构 */
+```
+
+三层覆盖，从粗到细：
+
+| 方式 | 命令 | 要不要重编译 |
+|---|---|---|
+| 环境变量选 profile | `OEM_PROFILE=alt ./bin/main.exe` | 否（两套都编进同一份二进制） |
+| `oem.ini` 微调颜色/文案/布局 | 改 `config/oem.ini` 后重启 | 否 |
+| 新增客户 profile | 新增 `oem_xxx.c` + 注册一行 | 是 |
+
+已实测两套差异很大的配置（宫格浅色 vs 列表石墨金），同一份二进制切换，均 0 警告 0 断言。
+
+**新增中文文案后必须重跑** `python scripts/gen_font.py`，否则字库缺字会显示方框。
 
 ## 学习路线
 
@@ -260,10 +291,12 @@ make debug                  # 开断言跑，查越界/野指针
 - [x] **产品规划**：智能家居中控台三大功能拆解（`docs/产品规划_智能家居中控台.md`）
 - [x] **M1**：中控台骨架 —— flex/grid 主页 + **三级信息架构**（分类宫格 → 房间页签 → 设备详情）+ 设备模型 + 事件总线 + ini 持久化
 - [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析（**当前用 app_mock 模拟 ASR 事件**）
-- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest、INVITE 双向、ACK/BYE、RTP 回声）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测通过，见 `docs/SIP联调环境.md`
-- [ ] **M4**：中文点阵字体（lv_font_conv）+ 图标资源
+- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**，见 `docs/SIP联调环境.md`
+- [x] **M4（部分）**：中文按需子集字库（`scripts/gen_font.py` → `src/ui/fonts/`，212 汉字 × 16/24px），**修掉了"灯/调/风/插/线"显示成方框的问题**
+- [x] **OEM 定制层**（超出原计划）：`src/oem/` 一套接口 + 两套 profile，运行期 `OEM_PROFILE=alt` 热切换宫格/列表两套首页，见 `docs/OEM定制指南.md`
 - [ ] **M5**：全功能量化压测（每个里程碑过一遍 stress，出 stats.csv 曲线）
-- [ ] **M6（等板子）**：`hal_fbdev.c`/`hal_audio.c` + 交叉编译 + 思必驰/eXosip 实装
+- [ ] **M6（等板子）**：`hal_fbdev.c`/`hal_audio.c`（ALSA）+ 交叉编译 + 思必驰/eXosip 实装
+- [ ] **M3 剩余**：视频（H.264 解码 + `lv_image` 显示）—— 室内机"可视"对讲的最后一块
 
 ## 参考
 

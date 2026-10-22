@@ -35,6 +35,7 @@
 #include "app/app_devices.h"
 #include "app/app_stats.h"
 #include "app/app_mock.h"
+#include "oem/oem.h"
 #ifdef APP_WITH_SIP
 #include "app/app_sip.h"
 #endif
@@ -88,6 +89,10 @@ int main(int argc, char **argv)
   /* - lv_example_label_1(); */
   /* - etc. */
   /* lv_demo_widgets();            ← 官方 demo（学习对照用） */
+  /* OEM：选 profile + 套 oem.ini 覆盖，必须最先做 —— 主题、文案、布局都读它 */
+  oem_init();
+  if (getenv("OEM_DUMP")) oem_dump();
+
   ui_theme_init(UI_THEME_LIGHT);  /* ← 主题/命名样式（先于一切界面） */
   app_events_init();              /* ← 事件总线（主线程分发 timer） */
   app_devices_init();             /* ← 设备模型（加载持久化状态） */

@@ -5,6 +5,7 @@
 #include "ui_common.h"
 #include "ui_theme.h"
 #include "ui_nav.h"
+#include "oem.h"
 
 /*---------------------------------------------------------------------------
  * 顶部返回栏
@@ -19,7 +20,7 @@ lv_obj_t *ui_topbar_create(lv_obj_t *scr, const char *title)
 {
     lv_obj_t *bar = lv_obj_create(scr);
     lv_obj_add_style(bar, &st_bar, 0);
-    lv_obj_set_size(bar, lv_pct(100), 44);
+    lv_obj_set_size(bar, lv_pct(100), oem()->layout.title_h);
     lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(bar, 10, 0);
@@ -109,8 +110,10 @@ lv_obj_t *ui_room_tabs_create(lv_obj_t *parent, uint8_t current,
     lv_obj_set_style_pad_column(row, 8, 0);
     lv_obj_set_scrollable(row, false);
 
-    static const struct { const char *name; uint8_t room; } defs[] = {
-        { "客厅", 0 }, { "卧室", 1 }, { "全宅", ROOM_ALL },
+    static const struct { oem_text_id_t txt; uint8_t room; } defs[] = {
+        { OEM_TXT_ROOM_0,   0        },
+        { OEM_TXT_ROOM_1,   1        },
+        { OEM_TXT_ROOM_ALL, ROOM_ALL },
     };
     for (unsigned i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
         lv_obj_t *btn = lv_button_create(row);
@@ -123,7 +126,7 @@ lv_obj_t *ui_room_tabs_create(lv_obj_t *parent, uint8_t current,
         lv_obj_t *lbl = lv_label_create(btn);
         lv_obj_add_style(lbl, &st_btn_label, 0);
         lv_obj_set_style_text_font(lbl, FONT_CJK, 0);
-        lv_label_set_text(lbl, defs[i].name);
+        lv_label_set_text(lbl, oem_text(defs[i].txt));
         lv_obj_center(lbl);
 
         if (defs[i].room == current) lv_obj_add_state(btn, LV_STATE_CHECKED);

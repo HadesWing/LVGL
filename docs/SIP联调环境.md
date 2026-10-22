@@ -68,7 +68,7 @@ SIP_SERVER=127.0.0.1 SIP_PORT=5060 SIP_USER=1001 SIP_PASS=1234 SIP_LOCAL_PORT=50
 | 3 | **头文件顺序** | `<winsock2.h>` 必须在 `<osip2/osip.h>` 之前（后者用到 `struct timeval`） |
 | 4 | **401 重放死循环** | 带认证重发后再收 401 直接置 ERROR，不再重试（`s_auth_tried` 门闩） |
 
-## 三、客户端选型（对面那台"门口机"用什么）
+## 四、客户端选型（对面那台"门口机"用什么）
 
 | 客户端 | 版本/体积 | 适合 | 不适合 |
 |--------|----------|------|--------|
@@ -111,7 +111,7 @@ MicroSIP 支持 direct IP call，不需要注册、不需要 SIP 服务器：
 - 我们侧：所有收发都有 `[sip] >>` / `[sip] <<` 日志；
 - 需要第三方视角时装 Wireshark，过滤 `sip || rtp`，本机回环流量也能抓到。
 
-## 四、自测开关（无界面也能跑全链路）
+## 五、自测开关（无界面也能跑全链路）
 
 客户端内置四个环境变量开关，用于 CI / 无人工点击的回归：
 
@@ -119,7 +119,10 @@ MicroSIP 支持 direct IP call，不需要注册、不需要 SIP 服务器：
 |------|------|
 | `SIP_AUTOANSWER=1` | 收到 INVITE 自动 200 接听（跳过 UI 点"接听"） |
 | `SIP_AUTOCALL=<号码>` | 注册成功后自动呼出指定号码 |
-| `SIP_AUTOHANGUP=<秒>` | 通话 N 秒后自动挂断（发 BYE） |
+| `SIP_AUTOHANGUP=<秒>` | 通话/振铃 N 秒后自动挂断（通话发 BYE，振铃发 CANCEL） |
+| `SIP_TONE=1` | 用 1kHz 正弦代替麦克风（无声卡也能验媒体链路 / 板端对讲自检） |
+| `SIP_RTP_ECHO=1` | 强制回声模式（不打开声卡，收到 RTP 原样回送） |
+| `SIP_EXPIRES=<秒>` | 注册有效期（默认 3600；测试续期用 60） |
 | `SIP_DEBUG=1` | 打印 ACK 原文等调试细节 |
 
 ### 双实例互拨（走真服务器，最接近产品形态）
@@ -148,7 +151,7 @@ python scripts/fake_sip_caller.py 5062 1001
 # INVITE → 100/180/200 → ACK → 50 个 RTP 包（全数回声）→ BYE → 200
 ```
 
-## 五、本轮踩到的三个协议坑（都是真问题）
+## 六、本轮踩到的三个协议坑（都是真问题）
 
 | 坑 | 现象 | 根因/解法 |
 |----|------|-----------|
@@ -156,15 +159,81 @@ python scripts/fake_sip_caller.py 5062 1001
 | **ACK 要用 Contact 地址** | 发到代理地址，对话匹配失败 | ACK/BYE 是端到端，Request-URI 取 200 OK 的 Contact；解析失败才退回响应源地址 |
 | **To 头必须原样回填** | 同上（匹配不上对话） | 用 200 OK 里的 To 原文（含 tag），不要自己拼 URI |
 
-## 六、路线图
+## 七、真实音频（M3 收尾）
+
+### 7.1 链路
+
+```
+麦克风 → SDL采集回调(20ms/160采样) → 采集环 → G.711A 编码 → RTP/12B头+160B → UDP
+UDP → RTP解包(跳过扩展头) → G.711A 解码 → 播放环(60ms预缓冲) → SDL播放回调 → 喇叭
+```
+
+- **编码**：PCMA（payload 8）为默认，同时支持 PCMU（0）；**按对端 200 OK 的 SDP 决定**（应答方说了算）。
+- **帧率**：20ms 一帧，160 采样 = 160 字节 → 64 kbps，与国际窄带语音一致。
+- **发送节奏**：按墙上时钟补帧（落后一次最多补 3 帧）。用"每轮 select 发一帧"会因系统定时器
+  精度（Windows 默认 15.6ms）跑成 33fps，对端播放缓冲会被抽干。
+- **预缓冲**：播放侧攒够 60ms 才开播，用一点延迟换掉抖动爆音。
+- **降级**：没有麦克风 → 只收不放（能听见门口机）；设备全无 → 回声模式（媒体通路自检）。
+
+### 7.2 无麦克风也能验（自测音源）
+
+```bash
+# 终端 1：作为被叫（自动接听）
+SIP_SERVER=127.0.0.1 SIP_USER=101 SIP_PASS=101 SIP_LOCAL_PORT=5064 \
+SIP_AUTOANSWER=1 ./bin/main.exe
+
+# 终端 2：作为主叫，用 1kHz 正弦代替麦克风，5 秒后挂断
+SIP_SERVER=127.0.0.1 SIP_USER=100 SIP_PASS=100 SIP_LOCAL_PORT=5062 \
+SIP_AUTOCALL=101 SIP_AUTOHANGUP=5 SIP_TONE=1 ./bin/main.exe
+```
+
+实测结果（本机跑通）：
+
+```
+A(发) [rtp] stats rx=0   tx=250 dur=5s (pps=50.0)   [audio] underrun=0
+B(收) [rtp] stats rx=250 tx=0   dur=5s             [audio] underrun=0
+```
+
+`pps=50.0` = 20ms 一帧 = 64kbps，**收发两侧计数一致**，说明 G.711 编解码与 RTP 封包时戳都正确。
+板子上 `SIP_TONE=1` 还能当"对讲自检"用：喇叭里应听到连续的 1kHz 嘟声。
+
+### 7.3 两个媒体侧的坑
+
+| 坑 | 现象 | 根因/解法 |
+|---|---|---|
+| **SDL 返回立体声设备** | 播放欠载 400+ 次，声音断续 | `allowed_changes` 传 0 强制单声道；否则每 20ms 被要走 320 采样（2ch） |
+| **音频初始化算进通话时长** | 一接通就自动挂断 | Windows WASAPI 首次开设备可耗 1~3s；`t_answer_ms` 必须放在 `rtp_start_media()` **之后** |
+
+## 八、呼出取消（CANCEL）与终态 ACK
+
+呼出中挂断必须发 **CANCEL**，而且：
+
+1. **CANCEL 复用 INVITE 的 branch + 同号 CSeq**（只换方法名）——否则服务器认为取消的是另一笔事务；
+2. 收到 `487 Request Terminated` **之后还要回 ACK**（RFC 3261 事务层要求，非 2xx 终态也要 ACK）；
+3. 所以**发完 CANCEL 不能立刻清对话状态**（branch/Call-ID 还要用），标记 `cancelled` 等 487 再清；
+   5 秒兜底超时，避免一直占线。
+
+实测（100 呼 102，3 秒后取消）：
+
+```
+A: >> CANCEL (cseq=1 branch=z9hG4bK104736) → << 200 OK → << 487 → >> ACK
+B: << CANCEL → >> 200 OK → >> 487 → << ACK
+```
+
+非 2xx 的 ACK 缺失是最容易被忽略的一条：没有它，UAS/代理会按事务定时器**反复重传 480/486/487**，
+日志看起来像"服务器抽风"，其实是客户端没确认。
+
+## 九、路线图
 
 - [x] REGISTER / 200 OK（UDP，select 收包线程）
 - [x] 401 Digest 认证（MD5，qop=auth / 无 qop 双支持）
+- [x] 注册续期（Expires 一半时重发，`SIP_EXPIRES` 可调）
 - [x] INVITE 呼入：100 Trying → 180 Ringing → 200 OK(SDP) → ACK → BYE/200
 - [x] INVITE 呼出：带 SDP，按 Contact 发 ACK
+- [x] 呼出取消 CANCEL + 487 ACK（含 5s 兜底）
+- [x] 非 2xx 终态 ACK（480/486/487 不再被重传）
 - [x] 对讲页 `ui_call.c`：来电（接听/拒接）+ 通话中（计时、RTP 收发计数），事件驱动压/出栈
-- [x] RTP 回声（PCMA 160B/20ms），无板验证双向媒体
-- [x] 非 SIP 杂包过滤（真实网络里会有扫描包，不再刷屏报错）
-- [ ] 真实音频采集/播放（板端 ALSA 或 PC 端 SDL 录音，M6 一并做）
-- [ ] 视频（H.264 解码 + lv_image 显示，室内机产品形态必需）
-- [ ] 通话中 401 认证、CANCEL、事务层重传（eXosip 迁移时一并解决）
+- [x] 真实音频：SDL 采集/播放 + G.711 A/μ 编解码 + 60ms 预缓冲 + 补帧节拍
+- [x] 无麦克风降级（只收不放）与回声模式（媒体自检）
+- [ ] 视频（H.264 解码 + `lv_image` 显示，室内机产品形态必需，**M3 剩余最后一块**）
+- [ ] 通话中 401 认证（INVITE 被挑战）、事务层重传（eXosip 迁移时一并解决）

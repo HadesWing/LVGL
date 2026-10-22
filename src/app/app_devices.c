@@ -4,6 +4,7 @@
  */
 #include "app_devices.h"
 #include "app_events.h"
+#include "oem.h"
 #include "lvgl.h"       /* 只为 LV_SYMBOL_* 图标常量 */
 
 #include <stdio.h>
@@ -130,15 +131,17 @@ const char *device_type_icon(uint8_t type)
 
 const char *device_type_name(uint8_t type)
 {
-    switch ((device_type_t)type) {
-    case DEV_LIGHT:   return "灯光";
-    case DEV_CURTAIN: return "窗帘";
-    case DEV_AC:      return "空调";
-    case DEV_FRESH:   return "新风";
-    case DEV_PLUG:    return "插座";
-    case DEV_CAM:     return "摄像头";
-    default:          return "设备";
-    }
+    /* 分类名属于 OEM 文案（有的客户叫"照明"而不是"灯光"），统一走 oem_text */
+    static const oem_text_id_t ids[DEV_TYPE_COUNT] = {
+        [DEV_LIGHT]   = OEM_TXT_CAT_LIGHT,
+        [DEV_CURTAIN] = OEM_TXT_CAT_CURTAIN,
+        [DEV_AC]      = OEM_TXT_CAT_AC,
+        [DEV_FRESH]   = OEM_TXT_CAT_FRESH,
+        [DEV_PLUG]    = OEM_TXT_CAT_PLUG,
+        [DEV_CAM]     = OEM_TXT_CAT_CAM,
+    };
+    if (type >= DEV_TYPE_COUNT) return "";
+    return oem_text(ids[type]);
 }
 
 void device_value_range(uint8_t type, int16_t *min, int16_t *max)
@@ -215,5 +218,10 @@ void device_run_scene(int scene)
 int         device_scene_count(void) { return (int)SCENE_N; }
 const char *device_scene_name(int scene)
 {
-    return (scene >= 0 && scene < (int)SCENE_N) ? s_scenes[scene].name : "";
+    /* 场景名可由 OEM 改（"会客""影院"…），命令序列保持平台一致 */
+    static const oem_text_id_t ids[4] = {
+        OEM_TXT_SCENE_0, OEM_TXT_SCENE_1, OEM_TXT_SCENE_2, OEM_TXT_SCENE_3,
+    };
+    if (scene < 0 || scene >= (int)SCENE_N) return "";
+    return oem_text(ids[scene]);
 }

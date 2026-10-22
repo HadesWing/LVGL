@@ -1074,7 +1074,9 @@
 #define LV_FONT_SOURCE_HAN_SANS_SC_14_CJK 0
 
 /** SourceHanSansSC 16 (CJK) */
-#define LV_FONT_SOURCE_HAN_SANS_SC_16_CJK 1
+/* 停用内置思源黑体：它只收录约 1500 常用字，界面必用字会缺（显示成方框）。
+   改用 scripts/gen_font.py 生成的按需子集 src/ui/fonts/ui_font_cjk_{16,24}.c */
+#define LV_FONT_SOURCE_HAN_SANS_SC_16_CJK 0
 
 /** Pixel perfect monospaced fonts */
 #define LV_FONT_UNSCII_8 1
@@ -1156,7 +1158,10 @@
 #define LV_FONT_FMT_TXT_LARGE 0
 
 /** Compressed fonts */
-#define LV_USE_FONT_COMPRESSED 0
+/* lv_font_conv 默认输出压缩字模（RLE），必须开这个才能解码；
+   代价是绘制时多一步解压（RK3308 的 A35 可忽略），换来字库体积约减 40%。
+   更弱的 MCU 可用 lv_font_conv --no-compress 生成，然后关掉本开关。 */
+#define LV_USE_FONT_COMPRESSED 1
 
 /** Draw a placeholder rectangle instead of nothing when a glyph is missing
  *  from the font.
