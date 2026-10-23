@@ -15,6 +15,27 @@
 #include <stdlib.h>
 
 /*---------------------------------------------------------------------------
+ * 为什么要包装一层 push/pop
+ *
+ * 绝大多数用例只关心"包内容对不对"，不关心序号；但 push 必须传 seq 才能
+ * 检测丢包。所以包一层：序号自动递增，用例里保持 4 个参数的清爽写法；
+ * 需要构造丢包的用例再直接用原始 API 传手工序号。
+ *
+ * 顺带说明：序号是**跨用例单调**的（不重置）。这没关系 —— 每个用例都新建
+ * 解包器，而解包器收到的第一个包只用来定基准、不判 gap。
+ *---------------------------------------------------------------------------*/
+static uint16_t s_ut_seq;
+
+static int t_push(h264_depack_t *d, const uint8_t *p, int n, uint32_t ts)
+{
+    return h264_depack_push(d, p, n, ts, s_ut_seq++);
+}
+static int t_pop(h264_depack_t *d, const uint8_t **au, uint32_t *ts)
+{
+    return h264_depack_pop(d, au, ts, NULL);
+}
+
+/*---------------------------------------------------------------------------
  * 构造 RTP payload 的小工具
  *---------------------------------------------------------------------------*/
 static int mk_single(uint8_t *out, uint8_t type, const uint8_t *data, int n)
@@ -99,21 +120,21 @@ UT_TEST(depack, single_nal_au_completes_on_ts_change)
 
     int n;
     n = mk_single(pkt, H264_NAL_SPS, sps + 1, (int)sizeof(sps) - 1);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000));
+    UT_EQ_INT(0, t_push(d, pkt, n, 1000));
     n = mk_single(pkt, H264_NAL_PPS, pps + 1, (int)sizeof(pps) - 1);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000));
+    UT_EQ_INT(0, t_push(d, pkt, n, 1000));
     n = mk_single(pkt, H264_NAL_IDR, idr + 1, (int)sizeof(idr) - 1);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000));
+    UT_EQ_INT(0, t_push(d, pkt, n, 1000));
 
     /* 还没换 ts，不该有完整 AU */
     const uint8_t *au; uint32_t ts;
-    UT_EQ_INT(0, h264_depack_pop(d, &au, &ts));
+    UT_EQ_INT(0, t_pop(d, &au, &ts));
 
     /* 下一帧的第一个包到了 → 上一帧收尾 */
     n = mk_single(pkt, H264_NAL_SLICE, idr + 1, 3);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 2000));
+    UT_EQ_INT(0, t_push(d, pkt, n, 2000));
 
-    int len = h264_depack_pop(d, &au, &ts);
+    int len = t_pop(d, &au, &ts);
     UT_ASSERT(len > 0);
     UT_EQ_INT(1000, ts);
     UT_EQ_INT(3, count_nals(au, len));
@@ -146,20 +167,20 @@ UT_TEST(depack, fu_a_reassembles_byte_exact)
 
     /* 第一片：S=1 E=0 */
     int n = mk_fu_a(pkt, H264_NAL_IDR, true, false, body, chunk);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 500));
+    UT_EQ_INT(0, t_push(d, pkt, n, 500));
     /* 中间片 */
     n = mk_fu_a(pkt, H264_NAL_IDR, false, false, body + chunk, chunk);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 500));
+    UT_EQ_INT(0, t_push(d, pkt, n, 500));
     /* 末片：E=1 */
     n = mk_fu_a(pkt, H264_NAL_IDR, false, true, body + chunk * 2, NAL_BODY - chunk * 2);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 500));
+    UT_EQ_INT(0, t_push(d, pkt, n, 500));
 
     /* 下一帧触发收尾 */
     n = mk_single(pkt, H264_NAL_SLICE, body, 4);
-    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 9000));
+    UT_EQ_INT(0, t_push(d, pkt, n, 9000));
 
     const uint8_t *au; uint32_t ts;
-    int len = h264_depack_pop(d, &au, &ts);
+    int len = t_pop(d, &au, &ts);
     UT_ASSERT(len > 0);
     UT_EQ_INT(305, len);      /* 4 起始码 + 1 NAL 头 + 300 正文 */
     UT_EQ_INT(500, ts);
@@ -193,21 +214,21 @@ UT_TEST(depack, fu_a_without_first_fragment_is_dropped)
 
     /* 直接来中间片（首片在网络上丢了） */
     int n = mk_fu_a(pkt, H264_NAL_IDR, false, false, body, 50);
-    UT_NE_INT(0, h264_depack_push(d, pkt, n, 100));
+    UT_NE_INT(0, t_push(d, pkt, n, 100));
 
     /* 再来末片 */
     n = mk_fu_a(pkt, H264_NAL_IDR, false, true, body + 50, 50);
-    UT_NE_INT(0, h264_depack_push(d, pkt, n, 100));
+    UT_NE_INT(0, t_push(d, pkt, n, 100));
 
     const h264_depack_stats_t *s = h264_depack_stats(d);
     UT_ASSERT(s->fu_broken >= 1);
 
     /* 触发收尾，AU 里不该有这个残缺 NAL */
     n = mk_single(pkt, H264_NAL_SLICE, body, 4);
-    h264_depack_push(d, pkt, n, 200);
+    t_push(d, pkt, n, 200);
 
     const uint8_t *au; uint32_t ts;
-    int len = h264_depack_pop(d, &au, &ts);
+    int len = t_pop(d, &au, &ts);
     if (len > 0) {
         int off, nal_len;
         UT_ASSERT_MSG(!find_nal(au, len, H264_NAL_IDR, 0, &off, &nal_len),
@@ -217,13 +238,13 @@ UT_TEST(depack, fu_a_without_first_fragment_is_dropped)
 }
 
 /*---------------------------------------------------------------------------
- * 4. 分片序列被打断：前一个 NAL 必须回退掉
+ * 4. 分片序列被打断：整帧必须作废
  *
  * 场景：S 片到了、中间丢了、然后发送端开始发**下一个** NAL 的 S 片。
- * 如果此时不回退，两个 NAL 的数据会拼成一个"看起来完整"的 NAL ——
- * 解码器会解出一帧撕裂的画面，而且不会报错。
+ * 如果此时只回退残缺的 NAL、剩下的照发，就是把一帧**缺了数据**的图交给
+ * 解码器 —— 解码器不报错，只画错，而且错误会顺着参考链传到后面每一帧。
  *---------------------------------------------------------------------------*/
-UT_TEST(depack, interrupted_fu_sequence_rolls_back)
+UT_TEST(depack, interrupted_fu_sequence_discards_whole_au)
 {
     h264_depack_t *d = h264_depack_new();
     UT_ASSERT(d != NULL);
@@ -235,30 +256,28 @@ UT_TEST(depack, interrupted_fu_sequence_rolls_back)
 
     /* 第一个 NAL 的 S 片（只有开头，中间丢了） */
     int n = mk_fu_a(pkt, H264_NAL_IDR, true, false, body, 60);
-    h264_depack_push(d, pkt, n, 100);
+    t_push(d, pkt, n, 100);
 
     /* 直接来下一个 NAL 的 S 片 */
     n = mk_fu_a(pkt, H264_NAL_SLICE, true, false, body + 100, 60);
-    h264_depack_push(d, pkt, n, 100);
+    t_push(d, pkt, n, 100);
     n = mk_fu_a(pkt, H264_NAL_SLICE, false, true, body + 160, 40);
-    h264_depack_push(d, pkt, n, 100);
+    t_push(d, pkt, n, 100);
 
     const h264_depack_stats_t *s = h264_depack_stats(d);
     UT_EQ_INT(1, s->fu_broken);
 
-    /* 收尾后 AU 里只应有那个完整的 SLICE，IDR 的残片必须已被回退 */
+    /* 换 ts 收尾 → 整帧丢弃，一个字节都不交给解码器。
+     *
+     * 这条断言被**改过**：第一版写的是"AU 里应只剩那个完整的 SLICE"，
+     * 理由是"残缺的 IDR 已回退，剩下的是好数据"。那是把"局部正确"当成
+     * 了"整体正确" —— 见本节开头的说明。 */
     n = mk_single(pkt, H264_NAL_SLICE, body, 4);
-    h264_depack_push(d, pkt, n, 999);
+    t_push(d, pkt, n, 999);
 
     const uint8_t *au; uint32_t ts;
-    int len = h264_depack_pop(d, &au, &ts);
-    UT_ASSERT(len > 0);
-
-    int off, nal_len;
-    UT_ASSERT_MSG(!find_nal(au, len, H264_NAL_IDR, 0, &off, &nal_len),
-                  "被打断的 IDR 残片必须回退，不能留在 AU 里");
-    UT_ASSERT(find_nal(au, len, H264_NAL_SLICE, 0, &off, &nal_len));
-    UT_EQ_INT(101, nal_len);   /* 1 字节头 + 60 + 40 字节正文 */
+    UT_EQ_INT(1, s->au_dropped);
+    UT_EQ_INT(0, t_pop(d, &au, &ts));
 
     h264_depack_free(d);
 }
@@ -285,15 +304,15 @@ UT_TEST(depack, stap_a_splits_into_nals)
     pkt[k++] = (uint8_t)(0x60 | H264_NAL_PPS);
     memcpy(pkt + k, pps_body, sizeof(pps_body)); k += (int)sizeof(pps_body);
 
-    UT_EQ_INT(0, h264_depack_push(d, pkt, k, 10));
+    UT_EQ_INT(0, t_push(d, pkt, k, 10));
 
     /* 收尾 */
     uint8_t t[8];
     int n = mk_single(t, H264_NAL_SLICE, sps_body, 3);
-    h264_depack_push(d, t, n, 20);
+    t_push(d, t, n, 20);
 
     const uint8_t *au; uint32_t ts;
-    int len = h264_depack_pop(d, &au, &ts);
+    int len = t_pop(d, &au, &ts);
     UT_ASSERT(len > 0);
     /* SPS + PPS 是同一个 AU 里的两个 NAL。
        注意：触发收尾的那个 SLICE 包属于**下一个** AU（ts 变了就分帧），
@@ -321,7 +340,7 @@ UT_TEST(depack, stap_a_bad_length_does_not_overrun)
     pkt[3] = 0x67;
     memset(pkt + 4, 0xAA, 8);
 
-    int r = h264_depack_push(d, pkt, (int)sizeof(pkt), 10);
+    int r = t_push(d, pkt, (int)sizeof(pkt), 10);
     UT_ASSERT(r != 0);                    /* 整个包被拒 */
     UT_EQ_INT(0, h264_depack_stats(d)->stap_pkt);
 
@@ -342,9 +361,9 @@ UT_TEST(depack, unsupported_nal_types_are_counted)
 
     uint8_t pkt[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     pkt[0] = (uint8_t)(0x60 | 29);        /* FU-B */
-    UT_NE_INT(0, h264_depack_push(d, pkt, 6, 1));
+    UT_NE_INT(0, t_push(d, pkt, 6, 1));
     pkt[0] = (uint8_t)(0x60 | 26);        /* MTAP16 */
-    UT_NE_INT(0, h264_depack_push(d, pkt, 6, 1));
+    UT_NE_INT(0, t_push(d, pkt, 6, 1));
 
     UT_EQ_INT(2, h264_depack_stats(d)->drop_type);
     h264_depack_free(d);
@@ -365,12 +384,12 @@ UT_TEST(depack, oversize_nal_is_rejected)
     static uint8_t pkt[60100];
 
     int n = mk_fu_a(pkt, H264_NAL_IDR, true, false, big, (int)sizeof(big));
-    h264_depack_push(d, pkt, n, 1);
+    t_push(d, pkt, n, 1);
 
     int pushed = 5;
     for (int i = 0; i < pushed; i++) {
         n = mk_fu_a(pkt, H264_NAL_IDR, false, false, big, (int)sizeof(big));
-        h264_depack_push(d, pkt, n, 1);
+        t_push(d, pkt, n, 1);
     }
     /* 60KB × 5 = 300KB > 256KB，必然触发上限 */
     UT_ASSERT(h264_depack_stats(d)->drop_oversize > 0);
@@ -388,18 +407,18 @@ UT_TEST(depack, pop_is_idempotent_after_empty)
     if (!d) return;
 
     const uint8_t *au = NULL; uint32_t ts = 0;
-    UT_EQ_INT(0, h264_depack_pop(d, &au, &ts));
-    UT_EQ_INT(0, h264_depack_pop(d, &au, &ts));
+    UT_EQ_INT(0, t_pop(d, &au, &ts));
+    UT_EQ_INT(0, t_pop(d, &au, &ts));
 
     uint8_t body[4] = { 1, 2, 3, 4 };
     uint8_t pkt[8];
     int n = mk_single(pkt, H264_NAL_SLICE, body, 4);
-    h264_depack_push(d, pkt, n, 1);
+    t_push(d, pkt, n, 1);
     n = mk_single(pkt, H264_NAL_SLICE, body, 4);
-    h264_depack_push(d, pkt, n, 2);       /* 触发收尾 */
+    t_push(d, pkt, n, 2);       /* 触发收尾 */
 
-    UT_ASSERT(h264_depack_pop(d, &au, &ts) > 0);
-    UT_EQ_INT(0, h264_depack_pop(d, &au, &ts));   /* 同一帧不能取两次 */
+    UT_ASSERT(t_pop(d, &au, &ts) > 0);
+    UT_EQ_INT(0, t_pop(d, &au, &ts));   /* 同一帧不能取两次 */
 
     h264_depack_free(d);
 }
@@ -421,7 +440,7 @@ UT_TEST(depack, slow_consumer_drops_old_frame)
 
     for (uint32_t ts = 1; ts <= 3; ts++) {
         int n = mk_single(pkt, H264_NAL_SLICE, body, 4);
-        h264_depack_push(d, pkt, n, ts * 1000);
+        t_push(d, pkt, n, ts * 1000);
     }
     /* 一次都没 pop：三次收尾只留下最后一个 AU */
     const h264_depack_stats_t *s = h264_depack_stats(d);
@@ -440,11 +459,11 @@ UT_TEST(depack, null_and_empty_input_are_safe)
     if (!d) return;
 
     uint8_t byte = 0x65;
-    UT_NE_INT(0, h264_depack_push(NULL, &byte, 1, 0));
-    UT_NE_INT(0, h264_depack_push(d, NULL, 1, 0));
-    UT_NE_INT(0, h264_depack_push(d, &byte, 0, 0));
-    UT_EQ_INT(0, h264_depack_pop(NULL, NULL, NULL));
-    UT_EQ_INT(0, h264_depack_pop(d, NULL, NULL));   /* 空队列 + 空输出指针 */
+    UT_NE_INT(0, t_push(NULL, &byte, 1, 0));
+    UT_NE_INT(0, t_push(d, NULL, 1, 0));
+    UT_NE_INT(0, t_push(d, &byte, 0, 0));
+    UT_EQ_INT(0, t_pop(NULL, NULL, NULL));
+    UT_EQ_INT(0, t_pop(d, NULL, NULL));   /* 空队列 + 空输出指针 */
 
     h264_depack_free(d);
     h264_depack_free(NULL);   /* 必须能安全释放 */
@@ -462,7 +481,7 @@ UT_TEST(depack, reset_clears_pending_but_keeps_stats)
     uint8_t body[4] = { 1, 2, 3, 4 };
     uint8_t pkt[8];
     int n = mk_single(pkt, H264_NAL_SLICE, body, 4);
-    h264_depack_push(d, pkt, n, 1);
+    t_push(d, pkt, n, 1);
 
     uint32_t before = h264_depack_stats(d)->pkt_in;
     UT_EQ_INT(1, before);
@@ -471,11 +490,143 @@ UT_TEST(depack, reset_clears_pending_but_keeps_stats)
 
     /* 残留的半帧不能被当成完整帧交出去 */
     const uint8_t *au; uint32_t ts;
-    UT_EQ_INT(0, h264_depack_pop(d, &au, &ts));
+    UT_EQ_INT(0, t_pop(d, &au, &ts));
 
     /* 统计是累计值，reset 不动它 —— 否则"通话中途断了一次重连"之后
        就再也看不到断之前丢了多少包了 */
     UT_EQ_INT(1, h264_depack_stats(d)->pkt_in);
+
+    h264_depack_free(d);
+}
+
+/*---------------------------------------------------------------------------
+ * 13. 序号跳跃 = 丢包：当前 AU 必须整帧丢弃
+ *
+ * 这是"丢包恢复"这条链的第一环。判据只有序号 —— 丢中间片的时候时间戳
+ * 不会变，靠 ts 是发现不了的。
+ *---------------------------------------------------------------------------*/
+UT_TEST(depack, seq_gap_means_loss_and_drops_au)
+{
+    h264_depack_t *d = h264_depack_new();
+    UT_ASSERT(d != NULL);
+    if (!d) return;
+
+    static uint8_t body[64];
+    memset(body, 0x11, sizeof(body));
+    static uint8_t pkt[128];
+
+    /* 正常收两包：SPS + PPS，序号连续 */
+    int n = mk_single(pkt, H264_NAL_SPS, body, 8);
+    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000, 100));
+    n = mk_single(pkt, H264_NAL_PPS, body, 4);
+    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000, 101));
+
+    const h264_depack_stats_t *s = h264_depack_stats(d);
+    UT_EQ_INT(0, s->gap);
+
+    /* 中间丢了 3 包（102/103/104），105 到了 */
+    n = mk_single(pkt, H264_NAL_IDR, body, 32);
+    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000, 105));
+
+    UT_EQ_INT(1, s->gap);
+
+    /* 换 ts 收尾 → 整帧丢弃，一个字节都不交给解码器 */
+    n = mk_single(pkt, H264_NAL_SLICE, body, 4);
+    h264_depack_push(d, pkt, n, 4000, 106);
+
+    UT_EQ_INT(1, s->au_dropped);
+    const uint8_t *au; uint32_t ts;
+    UT_EQ_INT(0, t_pop(d, &au, &ts));
+
+    h264_depack_free(d);
+}
+
+/*---------------------------------------------------------------------------
+ * 14. 序号回绕（65535 → 0）不能误判成丢包
+ *
+ * 一秒 50 包的话 21 分钟就会回绕一次，而门口机是 7×24 开着的。
+ * 误判的后果是每隔 21 分钟黑一下 —— 这种"定时发作"的问题最难查。
+ *---------------------------------------------------------------------------*/
+UT_TEST(depack, seq_wraparound_is_not_a_gap)
+{
+    h264_depack_t *d = h264_depack_new();
+    UT_ASSERT(d != NULL);
+    if (!d) return;
+
+    uint8_t body[4] = { 1, 2, 3, 4 };
+    uint8_t pkt[8];
+
+    int n = mk_single(pkt, H264_NAL_SLICE, body, 4);
+    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000, 65534));
+    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000, 65535));
+    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000, 0));
+    UT_EQ_INT(0, h264_depack_push(d, pkt, n, 1000, 1));
+
+    UT_EQ_INT(0, h264_depack_stats(d)->gap);
+
+    h264_depack_free(d);
+}
+
+/*---------------------------------------------------------------------------
+ * 15. AU 是否带 IDR：丢包恢复靠它判断"能不能重新开始"
+ *
+ * 一个 AU 里同时有 SPS/PPS/SEI 也有 slice，只看第一个 NAL 是判不出来的。
+ * 三种打包方式（单 NAL / STAP-A / FU-A）各自测一遍。
+ *---------------------------------------------------------------------------*/
+UT_TEST(depack, au_reports_whether_it_has_idr)
+{
+    h264_depack_t *d = h264_depack_new();
+    UT_ASSERT(d != NULL);
+    if (!d) return;
+
+    uint8_t body[40] = { 0 };
+    uint8_t pkt[128];
+    const uint8_t *au; uint32_t ts; bool has_idr;
+    uint16_t sq = 1000;
+
+    /* (a) 只有 P slice → 不是 IDR */
+    int n = mk_single(pkt, H264_NAL_SLICE, body, 4);
+    h264_depack_push(d, pkt, n, 7000, sq++);
+    h264_depack_push(d, pkt, n, 8000, sq++);      /* 换 ts 收尾 */
+    UT_ASSERT(h264_depack_pop(d, &au, &ts, &has_idr) > 0);
+    UT_ASSERT_MSG(!has_idr, "纯 P 帧的 AU 不能声称带 IDR");
+
+    /* (b) 单 NAL 的 IDR */
+    n = mk_single(pkt, H264_NAL_IDR, body, 4);
+    h264_depack_push(d, pkt, n, 9000, sq++);
+    h264_depack_push(d, pkt, n, 10000, sq++);
+    UT_ASSERT(h264_depack_pop(d, &au, &ts, &has_idr) > 0);
+    UT_ASSERT_MSG(has_idr, "带 IDR 的 AU 必须能认出来");
+
+    /* (c) FU-A 分片出来的 IDR（type 在 FU header 里） */
+    n = mk_fu_a(pkt, H264_NAL_IDR, true, false, body, 20);
+    h264_depack_push(d, pkt, n, 11000, sq++);
+    n = mk_fu_a(pkt, H264_NAL_IDR, false, true, body + 20, 20);
+    h264_depack_push(d, pkt, n, 11000, sq++);
+    h264_depack_push(d, pkt, n, 12000, sq++);
+    UT_ASSERT(h264_depack_pop(d, &au, &ts, &has_idr) > 0);
+    UT_ASSERT_MSG(has_idr, "FU-A 重组出的 IDR 也要能认出来");
+
+    h264_depack_free(d);
+}
+
+/*---------------------------------------------------------------------------
+ * 16. 连续序号不产生 gap（正向 sanity：别把好流判成丢包）
+ *---------------------------------------------------------------------------*/
+UT_TEST(depack, contiguous_seq_has_no_gap)
+{
+    h264_depack_t *d = h264_depack_new();
+    UT_ASSERT(d != NULL);
+    if (!d) return;
+
+    uint8_t body[8] = { 9, 8, 7, 6, 5, 4, 3, 2 };
+    uint8_t pkt[32];
+
+    for (int i = 0; i < 20; i++) {
+        int n = mk_single(pkt, H264_NAL_SLICE, body, 8);
+        h264_depack_push(d, pkt, n, (uint32_t)(i * 3000), (uint16_t)(20000 + i));
+    }
+    UT_EQ_INT(0, h264_depack_stats(d)->gap);
 
     h264_depack_free(d);
 }

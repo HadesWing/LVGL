@@ -113,7 +113,8 @@ set(MAIN_SOURCES src/mouse_cursor_icon.c
                  src/app/app_audio.c
                  src/app/g711.c
                  src/app/wav.c
-                 src/app/app_mock.c)
+                 src/app/app_mock.c
+                 src/app/app_version.c)
 
 if(LVGL_HAL STREQUAL "fbdev")
     if(WIN32)
@@ -247,7 +248,8 @@ endif()
 #                                      "只收包不解码"，纯语音通话完全不受影响）
 #   板子 RK3308 接 MPP 硬解时，加一个 vdec_mpp.c 在这里登记即可，上层不动。
 # ---------------------------------------------------------------------------
-list(APPEND MAIN_SOURCES src/media/h264_depack.c src/media/yuv2rgb.c src/app/app_video.c)
+list(APPEND MAIN_SOURCES src/media/h264_depack.c src/media/yuv2rgb.c src/media/resync.c
+                        src/media/rtcp.c src/app/app_video.c src/app/crc32.c)
 
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
@@ -263,7 +265,22 @@ else()
     message(STATUS "VDEC: 无解码器（装 mingw-w64-x86_64-ffmpeg 后重配）")
 endif()
 
+# ---------------------------------------------------------------------------
+# 版本号：唯一事实来源是仓库根的 VERSION 文件
+#   CMake 读进来 → 注入 -DAPP_VERSION → `indoor-unit --version` 打出
+#   打包脚本也读同一个文件，三者不会漂移。
+# ---------------------------------------------------------------------------
+file(READ "${PROJECT_SOURCE_DIR}/VERSION" APP_VERSION_STR)
+string(STRIP "${APP_VERSION_STR}" APP_VERSION_STR)
+if(NOT APP_VERSION_STR)
+    set(APP_VERSION_STR "0.0.0-nobuild")
+endif()
+message(STATUS "APP_VERSION: ${APP_VERSION_STR}")
+
 add_executable(main ${MAIN_SOURCES})
+
+# 版本号注入（APP_VERSION_STR 来自上面的 VERSION 文件）
+target_compile_definitions(main PRIVATE APP_VERSION="${APP_VERSION_STR}")
 
 # 可执行文件名可覆盖：不同内存池/断言版本各出自己的文件，避免互相覆盖 bin/main.exe
 #   例：-DMAIN_EXE_NAME=main64 → bin/main64.exe

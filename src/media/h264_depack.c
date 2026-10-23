@@ -28,11 +28,17 @@ struct h264_depack {
     int      au_len;
     uint32_t au_ts;
     bool     au_open;
+    bool     au_dirty;        /* 本 AU 已被丢包污染 —— 收尾时必须整帧丢弃 */
+    bool     au_has_idr;      /* 本 AU 里有 IDR */
 
     uint8_t *done;            /* 已完成、等待取走的 AU */
     int      done_len;
     uint32_t done_ts;
     bool     done_ready;
+    bool     done_has_idr;
+
+    uint16_t last_seq;        /* 上一个包的 RTP 序号（16 位会回绕） */
+    bool     seq_init;
 
     int      cur_nal_off;     /* 本 NAL 在 au 中的起点（断裂时回退用） */
     bool     fu_active;
@@ -92,10 +98,14 @@ void h264_depack_reset(h264_depack_t *d)
     d->au_len      = 0;
     d->au_open     = false;
     d->au_ts       = 0;
+    d->au_dirty    = false;
+    d->au_has_idr  = false;
     d->done_len    = 0;
     d->done_ready  = false;
+    d->done_has_idr = false;
     d->cur_nal_off = 0;
     d->fu_active   = false;
+    d->seq_init    = false;
 }
 
 const h264_depack_stats_t *h264_depack_stats(const h264_depack_t *d)
@@ -115,6 +125,7 @@ static bool nal_begin(h264_depack_t *d, uint8_t nal_hdr)
     d->cur_nal_off = d->au_len;
     au_put(d, k_start_code, 4);
     d->au[ d->au_len++ ] = nal_hdr;
+    if ((nal_hdr & 0x1F) == H264_NAL_IDR) d->au_has_idr = true;
     return true;
 }
 
@@ -125,29 +136,70 @@ static void au_finish(h264_depack_t *d)
 {
     if (d->au_len <= 0) return;
 
+    /* 脏帧一律不交出去。
+     *
+     * 这是"丢包恢复"能成立的**前提**：只要这个 AU 缺过数据，就整帧丢弃，
+     * 让上层（resync）去等下一个 IDR。曾经的做法是"回退掉残缺的那个 NAL，
+     * 剩下的照发" —— 看起来更"完整"，实际上是把一帧缺了数据的图交给解码器，
+     * 解码器不报错、只是画错，而且错误会顺着参考链传到后面每一帧。
+     * 逐字节比对（make duo-video）能照出这种事，靠眼睛看只会得出"信号不好"。 */
+    if (d->au_dirty) {
+        d->st.au_dropped++;
+        d->au_len     = 0;
+        d->au_open    = false;
+        d->au_dirty   = false;
+        d->au_has_idr = false;
+        d->fu_active  = false;
+        return;
+    }
+
     if (d->done_ready) {
         /* 上一帧还没被取走。说明上层处理速度跟不上码流 —— 实时场景下
            丢掉旧的比堆积起来更合理（堆积只会让延迟越来越大）。 */
         d->st.drop_slow++;
     }
     memcpy(d->done, d->au, (size_t)d->au_len);
-    d->done_len   = d->au_len;
-    d->done_ts    = d->au_ts;
-    d->done_ready = true;
+    d->done_len     = d->au_len;
+    d->done_ts      = d->au_ts;
+    d->done_ready   = true;
+    d->done_has_idr = d->au_has_idr;
 
     d->st.au_done++;
-    d->au_len    = 0;
-    d->au_open   = false;
-    d->fu_active = false;
+    d->au_len     = 0;
+    d->au_open    = false;
+    d->au_has_idr = false;
+    d->fu_active  = false;
+}
+
+/* 一个包丢了：当前 AU 已经不可能完整，标记为脏。
+   注意**不能**在这里直接把 au_len 清零并关掉 au_open —— 同一帧后面还有包
+   要进来（它们的 ts 没变），如果关掉 au_open，下一包会被当成新帧的开头，
+   于是我们会把"半帧"当成完整 AU 收尾交出去，比丢帧更糟。 */
+static void au_poison(h264_depack_t *d)
+{
+    if (d->au_open) d->au_dirty = true;
 }
 
 /*---------------------------------------------------------------------------
  * 喂包
  *---------------------------------------------------------------------------*/
-int h264_depack_push(h264_depack_t *d, const uint8_t *payload, int len, uint32_t ts)
+int h264_depack_push(h264_depack_t *d, const uint8_t *payload, int len,
+                     uint32_t ts, uint16_t seq)
 {
     if (!d || !payload || len < 1) return -1;
     d->st.pkt_in++;
+
+    /* --- 序号连续性：这是"有没有丢包"的唯一判据 ---------------------------
+     * 16 位序号会回绕，所以必须用 (uint16_t)(last + 1) 比较，
+     * 直接写 seq != last + 1 在 65535 → 0 会误判成丢包（1/65536 的概率，
+     * 但通话久了必然遇上，而且现象是"毫无征兆地花一下"）。 */
+    if (!d->seq_init) {
+        d->seq_init = true;
+    } else if (seq != (uint16_t)(d->last_seq + 1)) {
+        d->st.gap++;
+        au_poison(d);
+    }
+    d->last_seq = seq;
 
     /* --- AU 边界：时间戳变了就收尾 --- */
     if (!d->au_open) {
@@ -183,6 +235,7 @@ int h264_depack_push(h264_depack_t *d, const uint8_t *payload, int len, uint32_t
             if (!au_room(d, sz + 4)) { d->st.drop_oversize++; break; }
             au_put(d, k_start_code, 4);
             au_put(d, payload + off, sz);
+            if ((payload[off] & 0x1F) == H264_NAL_IDR) d->au_has_idr = true;
             off += sz;
             got++;
             d->st.nal_done++;
@@ -203,11 +256,14 @@ int h264_depack_push(h264_depack_t *d, const uint8_t *payload, int len, uint32_t
         uint8_t type   = fu_hdr & 0x1F;
 
         if (start) {
-            /* 上一个 NAL 若还没收到 E 片，就是序列断了：把它整段丢掉 */
+            /* 上一个 NAL 若还没收到 E 片，就是序列断了：把它整段丢掉，
+               并且**整个 AU 作废** —— 缺片的不只是这个 NAL 的数据，
+               解码器拿到这帧会画错，还会把错误顺着参考链传下去。 */
             if (d->fu_active) {
                 d->st.fu_broken++;
                 d->au_len = d->cur_nal_off;
                 d->fu_active = false;
+                d->au_dirty = true;
             }
             /* 重组后的 NAL header = FU indicator 的 F/NRI 位 + FU header 的 type */
             uint8_t nal_hdr = (uint8_t)(fu_ind & 0xE0) | type;
@@ -217,8 +273,10 @@ int h264_depack_push(h264_depack_t *d, const uint8_t *payload, int len, uint32_t
 
         } else {
             if (!d->fu_active) {
-                /* 中间片先到：首片丢了。这片没有任何上下文，只能丢。 */
+                /* 中间片先到：首片丢了。这片没有任何上下文，只能丢，
+                   而且这一帧已经不可能还原了。 */
                 d->st.fu_broken++;
+                d->au_dirty = true;
                 return -4;
             }
             /* 分片类型和当前 NAL 不一致 = 序列已经被打断（可能中间丢了片） */
@@ -227,6 +285,7 @@ int h264_depack_push(h264_depack_t *d, const uint8_t *payload, int len, uint32_t
                 d->st.fu_broken++;
                 d->au_len    = d->cur_nal_off;
                 d->fu_active = false;
+                d->au_dirty  = true;
                 return -4;
             }
         }
@@ -255,13 +314,16 @@ int h264_depack_push(h264_depack_t *d, const uint8_t *payload, int len, uint32_t
 /*---------------------------------------------------------------------------
  * 取 AU
  *---------------------------------------------------------------------------*/
-int h264_depack_pop(h264_depack_t *d, const uint8_t **p_au, uint32_t *p_ts)
+int h264_depack_pop(h264_depack_t *d, const uint8_t **p_au, uint32_t *p_ts,
+                    bool *p_has_idr)
 {
     if (!d || !d->done_ready) return 0;
-    if (p_au) *p_au = d->done;
-    if (p_ts) *p_ts = d->done_ts;
+    if (p_au)       *p_au       = d->done;
+    if (p_ts)       *p_ts       = d->done_ts;
+    if (p_has_idr)  *p_has_idr  = d->done_has_idr;
     int n = d->done_len;
-    d->done_ready = false;
-    d->done_len   = 0;
+    d->done_ready   = false;
+    d->done_len     = 0;
+    d->done_has_idr = false;
     return n;
 }

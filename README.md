@@ -87,7 +87,9 @@ make run        # 只运行
 | `make duo` | 本机起两个实例（室内机 + PC 客户端）对打，**双向音频各验一次**（SNR + 丢包 + 落盘） | 双端互通 |
 | `make duo-video` | **ffmpeg 推 RTP** → 室内机解包/解码/落盘 → 与参考 YUV **逐字节比对** | 视频解码正确性 |
 | `make duo-disp` | 解码 → **RGB565 缩放 → LVGL 绘制** → 抓屏 → 与参考帧**逐像素比对** | 视频上屏正确性 |
-| `make ut` | 自研代码单元测试（84 个用例，零依赖，PC 与板子同一份） | 回归 |
+| `make ut` | 自研代码单元测试（104 个用例，零依赖，PC 与板子同一份） | 回归 |
+| `make loss` | **注入丢包** → 逐帧 CRC 核对（开恢复必须 0 脏帧，关恢复必须 >0） | 丢包恢复 |
+| `make release` | 发布打包：UT → 发布构建（strip）→ `dist/*.tar.gz` + sha256 | 出货 |
 | `make rebuild` / `make clean` | 全量重编 / 删构建目录 | |
 
 两个环境变量随时可用（Windows 的 cmd 里用 `set LVGL_RUN_SEC=60` 后再跑）：
@@ -334,6 +336,200 @@ SIP_AUDIO_SRC=file SIP_AUDIO_SRC_FILE=test_8k.wav SIP_AUDIO_SINK=file \
 SIP_AUDIO_SINK_FILE=rx.wav SIP_NO_REGISTER=1 make run
 python scripts/audio_compare.py test_8k.wav rx.wav     # → SNR 43.1 dB
 ```
+
+## 从开发到发布（完整流水线）
+
+一个功能从改代码到出货，只有六个环节。每个环节都有**命令**和**通过判据**，
+判据全是数字，没有"看着差不多"这一档。
+
+| 环节 | 命令 | 通过判据 | 耗时 |
+|---|---|---|---|
+| 编译 | `make build` | 0 error / 0 warning（本项目开 `-Wall -Wextra`） | 增量 ~10s，全量 ~60s |
+| 单元测试 | `make ut` | **104 用例全过**，0 失败 0 崩溃 | < 1s |
+| 音频端到端 | `make duo` | 双向 **SNR ≥ 30 dB**（实测 43.1） | ~30s |
+| 视频解码 | `make duo-video` | **逐字节相同 299/299** | ~25s |
+| 视频上屏 | `make duo-disp` | **逐像素相同 62208/62208** | ~30s |
+| 丢包恢复 | `make loss` | 开恢复 **0 脏帧**；关恢复 **>0 脏帧** | ~70s |
+| 打包 | `make release` | 工作区干净 + UT 通过 → `dist/*.tar.gz` | 全量 ~90s，增量 ~20s |
+
+> 全部端到端测试都是**自驱动**的：脚本自己起实例、自己建立通话、自己推流、
+> 自己比对、自己退出。不需要人工点界面，也不需要第二台机器 —— 所以能放进 CI。
+
+### 0 一次性环境
+
+见 [`docs/本地部署流程.md`](docs/本地部署流程.md)（Windows + MSYS2，每步都实跑过）。
+懒人版：`bash scripts/setup_windows_msys2.sh`。板端（Linux）只需要
+`gcc / cmake / ninja / libsdl2-dev`（PC 模拟）或直接 fbdev。
+
+### 1 日常开发循环
+
+```bash
+make build        # 编译
+make run          # 运行（SDL 窗口，320x480）
+make stats        # 带指标：每 5 秒打印 FPS/内存/循环耗时，明细写 bin/stats.csv
+make debug        # 开 LVGL 断言（查越界/野指针，性能会掉，只在排查时用）
+make mem64        # 64KB 内存池跑（模拟小内存设备，找崩溃边界用）
+```
+
+两条日常纪律：
+
+- **新增任何中文文案后必须重跑 `python scripts/gen_font.py`**，
+  否则字库缺字会显示成方框（字库是提交进仓库的 `.c` 文件，构建期不跑 Python）。
+- `bin/devices.ini` 是运行态文件（点过界面就会变），提交前 `git checkout -- bin/devices.ini`。
+
+### 2 提交前自检：跑哪些、为什么
+
+不是每次都跑全部（`make loss` 要 70 秒），按改动面选：
+
+| 改了什么 | 必须跑 |
+|---|---|
+| 纯逻辑（g711/wav/sdp/crc32/resync…） | `make ut` |
+| 音频通路 | `make ut` + `make duo` |
+| 视频解包/解码 | `make ut` + `make duo-video` |
+| 上屏 / YUV 转换 / UI 线程 | `make ut` + `make duo-disp` |
+| 丢包、RTCP、序号处理 | `make ut` + `make loss` |
+| **发版前** | 全部 |
+
+为什么这么分：`make duo*` 证明的是"两个真进程 + 真 socket + 真 SDP 协商"这条链，
+单机自环证明不了协商；而 `make ut` 证明的是边界条件（丢包、回绕、缓冲刚好不够），
+端到端脚本很难稳定复现那些场景。两者互补，谁也替不了谁。
+
+UT 的实际价值有例子：它抓到过 `sdp.c` 用 `strstr` 找 rtpmap **跨行命中**，
+把 VP8 的 pt 当成 H.264 的 —— 端到端测试因为推流 pt 恰好也是 96 而"恰好通过"。
+详见 [`docs/单元测试.md`](docs/单元测试.md)。
+
+### 3 版本号
+
+**唯一事实来源是仓库根目录的 `VERSION` 文件**，CMake 读它注入 `-DAPP_VERSION`，
+打包脚本也读它。三处不会漂移。
+
+```bash
+cat VERSION          # 0.9.0
+./bin/main.exe --version
+# → indoor-unit 0.9.0  built Oct 23 2026 10:10:11 (gcc 16.2.0)
+```
+
+bump 规则（0.x 阶段）：
+
+| 变更 | 版本 |
+|---|---|
+| 只修 bug / 调参数 | `0.9.0` → `0.9.1` |
+| 加功能（向后兼容） | `0.9.1` → `0.10.0` |
+| 改配置格式 / SIP 交互不兼容 | `0.10.0` → `1.0.0` |
+
+`--version` 同时打编译器版本和构建时间，是为了现场排障：
+同一版本号可能重编过很多次（换了开关、换了工具链），对不上 build id 就说明
+"跑的不是这一份二进制"。这个参数**在 lv_init 之前处理**，所以 ssh 进板子
+不用接显示器也能查版本。
+
+### 4 一键发布
+
+```bash
+make release
+```
+
+它做五件事，顺序不能换：
+
+1. **拒绝脏工作区** —— 有未提交改动直接中止。带着未提交代码打包，是最危险的一步：
+   出厂二进制和仓库源码对不上，事后没法复现、也没法 `git bisect`。
+2. **跑 UT** —— 失败即中止。手动流程里最容易省掉的就是这一步（"改动很小，不跑了吧"）。
+3. **发布构建** —— 独立目录 `build-rel/`、产物名 `indoor-unit`、`-O2`、**strip**
+   （实测 1928 KB → 1571 KB）。独立目录是为了不和开发用的 `bin/main.exe` 互相覆盖。
+4. **组装 + 附 LGPL 材料** —— 见下面产物结构。
+5. **打 tar.gz + sha256**。
+
+产物结构：
+
+```
+dist/indoor-unit-0.9.0-linux-arm/
+├── bin/indoor-unit          已 strip 的主程序
+├── etc/sip.ini.example      配置模板（不含真密码）
+├── etc/indoor.service       systemd unit
+├── etc/install.sh           目标机安装脚本
+├── LICENSES/NOTICE.md       第三方组件与许可义务
+├── relink/                  ← libosip2 是 LGPL-2.1 静态链接，必须给重链接能力
+│   ├── obj.tar.gz             我们自己的目标文件
+│   ├── libosip2.a             我们链接时用的那个库
+│   └── link.txt               完整链接命令
+├── VERSION
+└── SHA256SUMS               包内自校验
+```
+
+`relink/` 不是可选项。LGPL-2.1 §6 要求"接收方能拿修改过的 libosip2 重新链接出同样的
+可执行文件"——只写一句"可向我们索取"等于没给（用户还得先联系你、再等你回复）。
+目标文件 + 静态库 + 原始链接命令三样凑齐才算真的能重链接。
+
+校验：
+
+```bash
+sha256sum -c dist/indoor-unit-0.9.0-linux-arm.tar.gz.sha256
+```
+
+### 5 部署到板子
+
+```bash
+tar xzf indoor-unit-0.9.0-linux-arm.tar.gz
+cd indoor-unit-0.9.0-linux-arm
+sudo ./etc/install.sh              # 装二进制 + 配置 + systemd，并启动
+sudo ./etc/install.sh --no-start   # 产线烧写：只装不起
+```
+
+安装脚本守三条纪律：
+
+1. **已有的 `/etc/indoor/sip.ini` 绝不覆盖** —— 里面是这台设备的账号密码。
+   升级固件把配置冲掉等于把设备变砖，现场只能拆机重烧。
+2. 新二进制先写临时名再 `mv` 原子改名 —— 升级途中掉电不会留下半个文件。
+3. 旧版本备份成 `/usr/bin/indoor-unit.prev` —— 能回滚。
+
+数据分三处放，这是嵌入式的纪律：
+
+| 数据 | 位置 | 丢了会怎样 |
+|---|---|---|
+| SIP 账号 / 服务器 | `/etc/indoor/sip.ini`（**只读**，出厂烧写） | 致命，设备变砖 |
+| 设备状态（开关/亮度） | `/var/lib/indoor/devices.ini`（可写） | 无所谓，回默认值 |
+| 日志 | journald + 本地轮转 | 无所谓 |
+
+配置查找顺序：`$SIP_INI` > `/etc/indoor/sip.ini` > `./sip.ini`；
+优先级：环境变量 > ini > 编译默认值。
+
+现场排障：
+
+```bash
+journalctl -u indoor -n 100 -f          # 看日志
+systemctl stop indoor && /usr/bin/indoor-unit   # 前台跑一遍，直接看打印
+/usr/bin/indoor-unit --version          # 确认跑的是哪一版（不需要显示器）
+```
+
+### 6 回滚
+
+```bash
+sudo cp -f /usr/bin/indoor-unit.prev /usr/bin/indoor-unit
+sudo systemctl restart indoor
+```
+
+因为只备份了一版，回滚只能退一级。要退更远就重新下发旧固件包 —— 这是有意的：
+在 flash 上保留多份二进制会挤占空间，而"回滚一次"通常足够定位问题。
+
+### 7 交叉编译到板子（M6，**尚未完成**）
+
+`hal_fbdev.c`（fbdev + evdev）还没写，CMake 在这种情况下会**明确报错而不是静默降级**：
+
+```
+LVGL_HAL=fbdev 只能在 Linux 上使用；Windows 请用 sdl
+src/hal/hal_fbdev.c 尚未实现（P1 任务：fbdev + evdev HAL）
+```
+
+交叉编译的接口已经留好，工具链就绪后一条命令：
+
+```bash
+TOOLCHAIN=cmake/arm-linux.cmake make release
+# → dist/indoor-unit-0.9.0-cross-arm-linux/
+```
+
+需要准备：Rockchip 交叉工具链（aarch64-linux-gnu）、libosip2 的交叉编译产物
+（`-DOSIP_ROOT=<交叉前缀>`）、以及板端的 MPP SDK（`vdec_mpp.c`，替换 `vdec_ffmpeg.c`）。
+
+**目前的发布包只有 PC 版**（Windows/Linux x64），用途是演示与联调，不能直接上板。
 
 ## 学习路线
 

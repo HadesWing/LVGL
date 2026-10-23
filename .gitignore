@@ -49,3 +49,13 @@ bin/*.png
 
 # WorkBuddy 本地数据（工作记忆、自动化配置）
 .workbuddy/
+
+# 发布产物与发布构建目录（每次 make release 重新生成，不入库）
+dist/
+build-rel/
+
+# 丢包验收的中间产物（每次跑重新生成）
+bin/loss_*.log
+bin/loss_*.yuv
+bin/loss_*.crc
+bin/loss_*.report

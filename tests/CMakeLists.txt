@@ -40,8 +40,11 @@ set(APP_SOURCES
     ${ROOT}/src/app/sip_md5.c
     ${ROOT}/src/app/sdp.c
     ${ROOT}/src/app/wav.c
+    ${ROOT}/src/app/crc32.c
     ${ROOT}/src/media/h264_depack.c
     ${ROOT}/src/media/yuv2rgb.c
+    ${ROOT}/src/media/resync.c
+    ${ROOT}/src/media/rtcp.c
     ${ROOT}/src/oem/oem.c
     ${ROOT}/src/oem/oem_default.c     # oem.c 里的 profile 表在这两个文件里
     ${ROOT}/src/oem/oem_alt.c

@@ -20,8 +20,18 @@
  *   3 个槽是算出来的：1 个正在显示（LVGL 还在用，不能写）+ 1 个已备好等主线程取
  *   + 1 个空闲可写。少于 3 个就会在 25fps/33fps 这两个节拍错开时零星丢帧。
  *
- * 发送方向（板子把摄像头画面推给门口机）留了接口但没实现 —— 那属于 M6 上板之后
- * 的事，而且要等 MPP 编码器可用。现在写个空壳只会让人误以为它能用。
+ * 【丢包恢复】（这一版的重点）
+ *   见 src/media/resync.h。要点：丢一个包就要整帧丢弃并停手，
+ *   然后发 RTCP PLI 请求关键帧，收到 IDR 才恢复上屏。
+ *   参数：
+ *     SIP_VIDEO_RESYNC = 0          关掉（对照实验用）
+ *     SIP_VIDEO_PLI_MS = 500        等待期间多久重发一次 PLI
+ *     SIP_VIDEO_RESYNC_TIMEOUT = 3  等多少秒还没 IDR 就放弃（单位秒，0 = 一直等）
+ *     SIP_VIDEO_FRAME_LOG = <路径>  每帧写一行 CRC，供 scripts/loss_verify.py 比对
+ *
+ * 【发送方向不存在】
+ *   室内机只解码显示，不编码视频（目标板上没有视频编码的需求）。
+ *   所以这一版只做接收，不预留发送接口 —— 留空壳只会让人误以为它能用。
  */
 #ifndef APP_VIDEO_H
 #define APP_VIDEO_H
@@ -48,9 +58,16 @@ bool app_video_wants_rx(void);
 /**
  * 收一个 RTP 视频 payload（不含 RTP 头）。
  * ts 是 RTP 时间戳（90 kHz），用来判 AU 边界。
+ * seq 是 RTP 序号 —— **必须传**，它是"丢了包没有"的唯一判据。
  * **在 RTP 线程调用**，内部会做解码和转换，最后 post 事件让主线程取画面。
  */
-void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts);
+void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts, uint16_t seq);
+
+/**
+ * 注册"请求关键帧"回调（由 SIP/RTP 层提供，内部发 RTCP PLI）。
+ * 只在通话期间有效，挂断时传 NULL 清掉。
+ */
+void app_video_set_key_req_cb(void (*cb)(void));
 
 /**
  * 上屏目标框（不含边框）。UI 建好视频控件后调用一次，转换时按这个框等比缩放。

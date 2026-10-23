@@ -1,0 +1,32 @@
+[Unit]
+Description=Indoor Unit (可视对讲室内机)
+# 网络就绪再启动：注册要联网，早起来只会白跑一轮退避
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/indoor-unit
+Restart=always
+RestartSec=2
+# 进程假死（UI 卡住但没退出）时由 systemd 重启。
+# 程序内部要定期喂狗，否则会变成"每隔 30 秒重启一次"——
+# 所以 WatchdogSec 只在实现了 sd_notify 的版本上打开，见 docs/发布与打包.md。
+# WatchdogSec=30
+
+# 配置在只读分区、状态在可写分区：两件事必须分开。
+# /etc 掉了 = 设备变砖（账号没了）；/var/lib 掉了 = 回默认值，无所谓。
+# 变量名必须和代码里一致（src/app/app_sip.c 读的是 SIP_INI）——
+# 写错了不会报错，只会静默用默认值，现场表现为"账号明明配了却不注册"。
+Environment=SIP_INI=/etc/indoor/sip.ini
+Environment=OEM_PROFILE=default
+WorkingDirectory=/var/lib/indoor
+StateDirectory=indoor
+
+# 嵌入式不需要 core dump 堆在 flash 上；要排查时临时放开
+LimitCore=0
+# 实时性：音频线程 20ms 一帧，被别的进程抢 CPU 就是爆音
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

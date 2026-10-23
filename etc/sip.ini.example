@@ -1,0 +1,34 @@
+# 室内机配置模板 —— 打包时随固件一起发布，首次安装写入 /etc/indoor/sip.ini
+#
+# 优先级：环境变量 > 本文件 > 编译默认值
+# 查找顺序：$SIP_INI > /etc/indoor/sip.ini > ./sip.ini
+#
+# 注意：本文件不含密码以外的敏感信息；密码由产线烧写，不进版本库。
+
+[account]
+# SIP 服务器（门口机所在的那台 SIP 服务器，或门口机自身 IP）
+server      = 192.168.1.100
+port        = 5060
+# 室内机账号（分机号）
+user        = 1001
+password    = CHANGE_ME
+# 注册有效期（秒）。服务器下发的值更小则以其为准
+expires     = 3600
+
+[media]
+# 本地 SIP 端口。RTP 端口由它派生：
+#   音频 = local_port + 1000（往上找偶数口）
+#   视频 = 音频端口 + 2
+# 改这个值就等于整块挪动端口段，多网卡/多实例时必须错开。
+local_port  = 5062
+
+# 本机 IP 覆盖（多网卡设备建议填，否则可能选错网卡导致双方静音）
+# local_ip  = 192.168.1.50
+
+[behavior]
+# 1 = 不注册、点对点直呼（联调用）；产线必须是 0
+no_register = 0
+
+[oem]
+# 白牌配置档：default（DeepSmart/浅色/宫格）或 alt（AuroraHome/石墨金/列表）
+profile     = default

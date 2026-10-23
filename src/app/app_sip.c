@@ -14,6 +14,8 @@
 #include "app_events.h"
 #include "app_audio.h"
 #include "app_video.h"
+#include "app_time.h"
+#include "rtcp.h"
 #include "sdp.h"
 #include "g711.h"
 #include "sip_md5.h"
@@ -22,6 +24,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* 我们自己的 SSRC：PLI 里"谁在抱怨"那一栏。值随便定，只要在同一路通话里稳定。
+   用固定常量而不是随机数，是为了抓包时一眼能认出哪边是室内机。 */
+#define RTCP_LOCAL_SSRC 0x494E444FUL    /* "INDO" */
+
+static void rtcp_send_pli(void);   /* 提前声明：rtp_start_media 里要注册它 */
 
 /* 注意顺序：WinSock 必须在 osip 之前（osip.h 里用到 struct timeval） */
 #ifdef _WIN32
@@ -143,6 +151,8 @@ static bool     s_rtp_echo;      /* 无声卡时（CI）用回声验证媒体通
 static uint32_t s_v_rx;          /* 收到的视频 RTP 包数 */
 static uint32_t s_v_pt_bad;      /* pt 不匹配被丢弃的包数 */
 static uint32_t s_v_last_ts;
+static uint32_t s_v_ssrc;        /* 对端视频 SSRC（发 PLI 要填） */
+static uint32_t s_v_pli;         /* 实际发出去的 PLI 次数 */
 
 static void rtp_send_frame(void);
 
@@ -172,16 +182,9 @@ static bool is_reg_response(osip_message_t *msg)
     return atoi(msg->cseq->number) == s_reg_cseq;
 }
 
-static uint64_t now_ms(void)
-{
-#ifdef _WIN32
-    return (uint64_t)GetTickCount64();
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
-#endif
-}
+/* 单调时钟统一放 app_time.h，别再各写一份 —— 系统时间被 NTP 往回拨一次，
+   所有 `now - start` 就全乱了（表现：超时逻辑时不时抽风，且只在联网的板子上）。 */
+static uint64_t now_ms(void) { return app_now_ms(); }
 
 /* 进程号：Call-ID 里必须带上。
    踩过的坑：srand(time(NULL)) 做种子，两台设备（或同机两个实例）在同一秒启动
@@ -417,6 +420,12 @@ static void rtp_start_media(void)
         printf("[rtp] video: 未建立（local_v=%u remote_v=%u）\n",
                (unsigned)s_call.rtp_local_v, (unsigned)s_call.rtp_remote_v);
     }
+
+    /* 丢包时 app_video 回调这里发 RTCP PLI。
+       为什么走回调而不是"各自轮询"：丢包信号在 app_video 手上
+       （序号断了 / 整帧不全 / 解码器报错），而 RTCP 出口在 app_sip 手上。
+       挂断时清掉，不留悬垂指针。 */
+    app_video_set_key_req_cb(rtcp_send_pli);
     fflush(stdout);
 }
 
@@ -433,13 +442,14 @@ static void rtp_print_stats(const char *why)
     /* 视频单独一行：混在音频里会让人误以为"pps 50 就是全部正常"，
        而实际上视频可能一个包都没进来 */
     if (s_call.video_on || s_v_rx || s_v_pt_bad)
-        printf("[rtp] video stats(%s) pkt=%u pt_bad=%u last_ts=%u\n",
-               why, s_v_rx, s_v_pt_bad, s_v_last_ts);
+        printf("[rtp] video stats(%s) pkt=%u pt_bad=%u last_ts=%u pli=%u\n",
+               why, s_v_rx, s_v_pt_bad, s_v_last_ts, s_v_pli);
     fflush(stdout);
 }
 
 static void rtp_stop_media(void)
 {
+    app_video_set_key_req_cb(NULL);
     app_video_stats_print("hangup");
     app_video_close();
     app_audio_close();
@@ -875,6 +885,7 @@ static void call_reset(void)
     s_call.rtp_remote_v  = 0;
     s_v_rx = s_v_pt_bad = 0;
     s_v_last_ts = 0;
+    s_v_ssrc = 0;
 }
 
 static void idle_state(void)
@@ -1414,6 +1425,45 @@ static void rtp_on_readable(void)
  * 独立 socket、独立计数 —— "音频通了视频没通"这种问题，第一眼要看的就是
  * 视频包有没有进来，而不是去翻解码日志。
  *---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------
+ * 发 RTCP PLI（Picture Loss Indication）请求关键帧
+ *
+ * 丢包后我们自己只能"等下一个 IDR"。IDR 什么时候来由对端决定，
+ * GOP 60 @30fps 就是最坏等 2 秒。PLI 等于告诉对端"我这帧坏了，立刻补个 I 帧"。
+ *
+ * 端口：RTCP 惯例是 RTP 端口 +1（RFC 3550 §11）。对端若用 a=rtcp: 指定了别的
+ * 端口，这一版没解析该属性 —— 收到 PLI 没反应也不影响解码，只是恢复慢，
+ * 所以留着；真联调时如果对端不响应，第一件事就是抓包看 PLI 发到哪去了。
+ *
+ * 容错：sendto 失败只计数不报错。RTCP 是"加速器"，不是通路 ——
+ * 它挂了不该让通话挂。
+ *---------------------------------------------------------------------------*/
+static void rtcp_send_pli(void)
+{
+    if (s_rtp_v == SOCK_INVALID || !s_call.rtp_remote_v || !s_call.remote_ip[0])
+        return;
+
+    uint8_t buf[RTCP_PLI_BYTES];
+    int n = rtcp_build_pli(buf, (int)sizeof(buf), RTCP_LOCAL_SSRC, s_v_ssrc);
+    if (n != RTCP_PLI_BYTES) return;
+
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family      = AF_INET;
+    to.sin_port        = htons((uint16_t)(s_call.rtp_remote_v + 1));
+    to.sin_addr.s_addr = inet_addr(s_call.remote_ip);
+
+    if (sendto(s_rtp_v, (const char *)buf, n, 0,
+               (struct sockaddr *)&to, sizeof(to)) < 0) {
+#ifdef _WIN32
+        printf("[rtp] PLI 发送失败 (%d)\n", WSAGetLastError());
+#else
+        printf("[rtp] PLI 发送失败 (%s)\n", strerror(errno));
+#endif
+    }
+    s_v_pli++;
+}
+
 static void rtp_video_on_readable(void)
 {
     static uint8_t vbuf[2048];
@@ -1447,10 +1497,14 @@ static void rtp_video_on_readable(void)
 
     uint32_t ts = ((uint32_t)vbuf[4] << 24) | ((uint32_t)vbuf[5] << 16) |
                   ((uint32_t)vbuf[6] << 8)  |  (uint32_t)vbuf[7];
+    uint16_t sq = (uint16_t)(((uint16_t)vbuf[2] << 8) | (uint16_t)vbuf[3]);
+    uint32_t sr = ((uint32_t)vbuf[8] << 24) | ((uint32_t)vbuf[9] << 16) |
+                  ((uint32_t)vbuf[10] << 8) |  (uint32_t)vbuf[11];
 
     s_v_rx++;
     s_v_last_ts = ts;
-    app_video_on_rtp(payload, plen, ts);
+    s_v_ssrc    = sr;          /* 每次刷新：对端重启换 SSRC 也跟得上 */
+    app_video_on_rtp(payload, plen, ts, sq);
 }
 
 /*---------------------------------------------------------------------------

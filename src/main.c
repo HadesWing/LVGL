@@ -13,6 +13,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #ifdef _WIN32
   #include <windows.h>   /* SetConsoleOutputCP：让 printf 的中文不乱码 */
 #endif
@@ -35,6 +36,7 @@
 #include "app/app_devices.h"
 #include "app/app_stats.h"
 #include "app/app_mock.h"
+#include "app/app_version.h"
 #include "oem/oem.h"
 #ifdef APP_WITH_SIP
 #include "app/app_sip.h"
@@ -68,13 +70,52 @@
 
 int main(int argc, char **argv)
 {
-  (void)argc; /*Unused*/
-  (void)argv; /*Unused*/
-
 #ifdef _WIN32
   /* 源码是 UTF-8，Windows 控制台默认 GBK(936)，不切换就会打出乱码 */
   SetConsoleOutputCP(CP_UTF8);
 #endif
+
+  /* stdout 改成行缓冲。
+     默认行为：输出到终端是行缓冲，重定向到文件/管道就变成**全缓冲**（4KB）。
+     嵌入式上日志基本都是重定向（journald、串口、nohup），于是最关键的
+     那几行 —— 挂断统计、崩溃前的最后几条 —— 还在缓冲区里，进程一被 kill
+     就永远看不到。排查"为什么挂断时统计是空的"能查半天。
+     代价：每行一次 write。本程序的日志都是状态变化时才打，不是每帧打，
+     这点开销可以忽略。 */
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IOLBF, 0);
+
+  /* 参数处理必须在 lv_init / hal_init **之前**：
+     板上排障经常是 ssh 进去敲一行命令，此时没有显示设备。
+     如果先初始化 LVGL/SDL 再解析参数，--version 会因为打不开 framebuffer 直接失败，
+     结果想查个版本号还得先把屏幕接上。 */
+  for (int i = 1; i < argc; i++) {
+    const char *a = argv[i];
+    if (!a) continue;
+    if (a[0] != '-') continue;             /* 忽略非选项参数，别因为多打一个词就退出 */
+
+    if (strcmp(a, "--version") == 0 || strcmp(a, "-V") == 0) {
+      printf("indoor-unit %s\n", app_build_info());
+      return 0;
+    }
+    if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+      printf("用法: indoor-unit [--version] [--help]\n\n");
+      printf("室内机主程序（带屏可视对讲）。无参数 = 正常启动。\n\n");
+      printf("配置优先级：环境变量 > sip.ini > 编译默认值\n");
+      printf("  SIP_SERVER / SIP_USER / SIP_PASSWORD   SIP 服务器与账号\n");
+      printf("  SIP_LOCAL_PORT      本地 SIP 端口（默认 5062，RTP 由它派生）\n");
+      printf("  SIP_NO_REGISTER=1   点对点直呼，不注册\n");
+      printf("  SIP_AUTOANSWER=1    自动接听；SIP_AUTOCALL=sip:1001@IP:PORT 自动呼出\n");
+      printf("  SIP_VIDEO_SINK      disp|file|drop  画面去向（默认 drop 不收视频）\n");
+      printf("  SIP_VIDEO_RESYNC=0  关闭丢包恢复（默认开启，做 A/B 对照用）\n");
+      printf("  OEM_PROFILE         白牌配置档：default|alt；OEM_DUMP=1 打印生效值\n");
+      printf("  LVGL_STATS=1        每 5 秒打印帧率/内存/循环耗时\n");
+      printf("\n详细说明见 docs/ 下的文档。\n");
+      return 0;
+    }
+    fprintf(stderr, "未知参数：%s（用 --help 看支持项）\n", a);
+    return 2;
+  }
 
   /*Initialize LVGL*/
   lv_init();

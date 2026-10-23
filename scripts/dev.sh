@@ -151,8 +151,30 @@ case "$CMD" in
         echo "✅ 解码探针：$(pwd)/bin/h264_probe$SUFFIX"
         cd bin && exec "./h264_probe$SUFFIX" "$@"
         ;;
+    relbuild)
+        # 发布构建：独立目录 + 独立产物名 + strip，不碰开发用的 build/
+        #   为什么单独一个目录：发布版和开发版编到同一个 bin/ 里会互相覆盖，
+        #   打包时"用的是哪一份"就说不清了（这个坑在版本对不上时特别难查）。
+        BUILD_DIR=build-rel
+        TOOLCHAIN_ARGS=""
+        [ -n "${TOOLCHAIN:-}" ] && TOOLCHAIN_ARGS="-DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN"
+        configure -DMAIN_EXE_NAME=indoor-unit $TOOLCHAIN_ARGS
+        compile
+        REL_EXE="bin/indoor-unit$SUFFIX"
+        [ -f "$REL_EXE" ] || { echo "❌ 找不到 $REL_EXE"; exit 1; }
+
+        # strip 掉符号表：体积能小 60% 以上（板上 flash 是按 MB 算钱的）。
+        # 代价是 core dump 里的调用栈只剩地址 —— 排查时用未 strip 的
+        # build-rel 里那份对着看，或者用 .debug 分离文件（暂时不搞，先留一手）。
+        BEFORE=$(wc -c < "$REL_EXE")
+        if command -v strip >/dev/null 2>&1; then
+            strip --strip-unneeded "$REL_EXE" 2>/dev/null || strip "$REL_EXE" 2>/dev/null || true
+        fi
+        AFTER=$(wc -c < "$REL_EXE")
+        echo "✅ 发布版：$(pwd)/$REL_EXE  $((BEFORE/1024)) KB → $((AFTER/1024)) KB（strip 后）"
+        ;;
     clean)
-        cmake -E rm -rf build build-64k build-debug
+        cmake -E rm -rf build build-64k build-debug build-rel
         rm -rf build-mem* 2>/dev/null || true
         echo "build/ build-64k/ build-debug/ build-mem*/ 已删除"
         ;;
@@ -171,7 +193,8 @@ make echo         板端自测：内置 SIP 回声应答器（纯 C，无需 Pyt
 make duo          双端互通：本机两个实例对打，双向音频各验一次
 make duo-video    视频接收链路：ffmpeg 推 RTP → 解包/解码/落盘 → 比对参考 YUV
 make duo-disp     视频上屏链路：解码 → RGB565 缩放 → LVGL 绘制 → 抓屏逐像素比对
-make ut           自研代码单元测试（84 个用例，零依赖）
+make ut           自研代码单元测试（104 个用例，零依赖）
+make release      发布打包：UT → 发布构建（strip）→ dist/ 下出 tar.gz + sha256
 make rebuild      全量重编（= clean + build）
 make clean        删除所有构建目录
 
@@ -180,6 +203,8 @@ make clean        删除所有构建目录
   bash scripts/duo_video_test.sh [秒]         视频接收链路：ffmpeg 推 RTP → 解包/解码/落盘 → 比对参考 YUV
   bash scripts/duo_disp_test.sh [秒] [抓屏帧] 视频上屏链路：解码 → RGB565 → LVGL → 抓屏逐像素比
   bash scripts/dev.sh ut [过滤]               自研代码单元测试（零依赖；ut g711 只跑某组）
+  bash scripts/loss_test.sh [秒] [丢包规则]     丢包恢复验收：注入丢包 + 逐帧 CRC 核对（含对照组）
+  bash scripts/dev.sh relbuild                 只做发布构建（strip 后的 bin/indoor-unit）
   bash scripts/dev.sh echo                     起 SIP 回声应答器
   bash scripts/dev.sh probe <file.h264>        离线 H.264 解码探针：打印单帧耗时
   bash scripts/dev.sh probe <file.h264> --rgb565 frame.raw   额外导出 RGB565 帧

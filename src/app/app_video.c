@@ -13,11 +13,21 @@
  * 上屏为什么自己转 RGB565 而不是把 YUV 丢给 LVGL：
  *   采样目标尺寸（288x216）比源（640x480）小一半多，转换时顺手缩小，
  *   一步到位；把整幅 YUV 丢进显存再让 LVGL 缩，浪费 4 倍带宽。
+ *
+ * 丢包怎么处理（本文件 + src/media/resync.c）：
+ *   H.264 的 P 帧靠参考链，缺一帧后面全错，画面会一直花到下一个 IDR。
+ *   所以丢包不是"把残缺帧解出来"，而是立刻停手 + 要关键帧：
+ *     序号断了（gap） → 当前 AU 整帧丢弃 → 进入"等 IDR"
+ *     → 发 RTCP PLI 请对端补一个 I 帧 → 收到 IDR 才恢复上屏。
+ *   等待期间画面停在最后一帧好帧上（冻结，不花）。
  */
 #include "app_video.h"
 #include "app_events.h"
 #include "app_lock.h"
+#include "app_time.h"
+#include "crc32.h"
 #include "h264_depack.h"
+#include "resync.h"
 #include "vdec.h"
 #include "yuv2rgb.h"
 
@@ -68,6 +78,16 @@ static struct {
     uint32_t         w, h;
     uint64_t         bytes;
     bool             logged_size;  /* 尺寸只打一次，避免 30fps 刷屏 */
+    bool             debug;        /* SIP_VIDEO_DEBUG=1：逐帧打印闸门决策 */
+
+    /* --- 丢包恢复 --- */
+    resync_t         rs;
+    uint32_t         gap_seen;     /* 上次看到 depack 的 gap 计数，用来发现"新丢包" */
+    uint32_t         drop_seen;    /* 同上，看 au_dropped */
+    FILE            *flog;         /* 逐帧 CRC 日志（可选） */
+    char             flog_path[256];
+    uint32_t         pli_sent;     /* 通过回调发出的关键帧请求数 */
+    void           (*key_req_cb)(void);
 
     /* --- 上屏 --- */
     int              box_w, box_h;
@@ -113,6 +133,24 @@ static void route_parse_env(void)
              (f && *f) ? f : "video_rx.yuv");
 
     s_v.nodec = getenv("SIP_VIDEO_NODEC") != NULL;
+    s_v.debug = getenv("SIP_VIDEO_DEBUG") != NULL;
+
+    /* --- 丢包恢复 --- */
+    const char *off = getenv("SIP_VIDEO_RESYNC");
+    bool enabled = !(off && (strcmp(off, "0") == 0));
+
+    uint32_t pli_ms = 0;
+    const char *p = getenv("SIP_VIDEO_PLI_MS");
+    if (p && *p) pli_ms = (uint32_t)strtoul(p, NULL, 10);
+
+    uint32_t giveup = RESYNC_GIVEUP_MS_DEFAULT;
+    const char *g = getenv("SIP_VIDEO_RESYNC_TIMEOUT");   /* 单位是秒 */
+    if (g && *g) giveup = (uint32_t)strtoul(g, NULL, 10) * 1000u;
+
+    resync_init(&s_v.rs, enabled, pli_ms, giveup);
+
+    const char *lg = getenv("SIP_VIDEO_FRAME_LOG");
+    snprintf(s_v.flog_path, sizeof(s_v.flog_path), "%s", (lg && *lg) ? lg : "");
 }
 
 const char *app_video_route_desc(void)
@@ -193,6 +231,8 @@ bool app_video_open(void)
         printf("[video] 解包器分配失败（内存不够？）\n");
         return false;
     }
+    s_v.gap_seen  = h264_depack_stats(s_v.dep)->gap;
+    s_v.drop_seen = h264_depack_stats(s_v.dep)->au_dropped;
 
     if (!s_v.nodec) {
         if (!vdec_available()) {
@@ -217,6 +257,12 @@ bool app_video_open(void)
             return false;
         }
         printf("[video] 落盘 → %s (YUV420P 裸流，无容器)\n", s_v.sink_path);
+    }
+
+    if (s_v.flog_path[0]) {
+        s_v.flog = fopen(s_v.flog_path, "w");
+        if (!s_v.flog)
+            printf("[video] 打不开帧日志 %s，继续但不记录 CRC\n", s_v.flog_path);
     }
 
     if (s_v.sink == VSINK_DISP) {
@@ -249,6 +295,12 @@ void app_video_close(void)
         vdec_close(s_v.dec);
         s_v.dec = NULL;
     }
+    if (s_v.flog) {
+        fflush(s_v.flog);
+        fclose(s_v.flog);
+        s_v.flog = NULL;
+        printf("[video] 帧日志 → %s\n", s_v.flog_path);
+    }
     if (s_v.dep) {
         h264_depack_free(s_v.dep);
         s_v.dep = NULL;
@@ -273,6 +325,11 @@ void app_video_close(void)
 }
 
 bool app_video_is_open(void) { return s_v.opened; }
+
+void app_video_set_key_req_cb(void (*cb)(void))
+{
+    s_v.key_req_cb = cb;
+}
 
 bool app_video_wants_rx(void)
 {
@@ -389,20 +446,101 @@ static void sink_disp_frame(const vframe_t *f, uint32_t frame_no)
 }
 
 /*---------------------------------------------------------------------------
+ * 帧指纹日志（可选，SIP_VIDEO_FRAME_LOG 打开）
+ *
+ * 存的是"每一帧内容"的 CRC，而不是帧号。理由：丢包恢复会跳帧，
+ * 落盘文件的第 N 帧早就对不上参考文件的第 N 帧了，按位置比会整体错位；
+ * 而 CRC 是内容指纹，天然免疫对齐问题 —— 只要写出去的每一帧都能在
+ * 参考集合里找到同指纹的帧，就说明没有一帧是脏的。
+ *---------------------------------------------------------------------------*/
+static void frame_log(const vframe_t *f, uint32_t idx)
+{
+    if (!s_v.flog) return;
+
+    uint32_t crc = 0;
+    for (int p = 0; p < 3; p++) {
+        int pw = (p == 0) ? f->w : (f->w + 1) / 2;
+        int ph = (p == 0) ? f->h : (f->h + 1) / 2;
+        const uint8_t *src = f->plane[p];
+        if (!src) return;
+        for (int y = 0; y < ph; y++)
+            crc = crc32_update(crc, src + (size_t)y * (size_t)f->linesize[p], (size_t)pw);
+    }
+    fprintf(s_v.flog, "%u %d %d %08x\n", idx, f->w, f->h, crc);
+}
+
+static void request_keyframe(void)
+{
+    if (s_v.key_req_cb) {
+        s_v.key_req_cb();
+        s_v.pli_sent++;
+    }
+}
+
+/* 统一的"发现丢包"入口：进入等待 + 立即请求关键帧。
+ *
+ * 三个信号都算丢包：
+ *   1) depack 的 gap（序号断了）
+ *   2) depack 的 au_dropped（整帧被判数据不全）
+ *   3) 解码器报错（vdec_get 返回负数） */
+static void on_loss_detected(void)
+{
+    const h264_depack_stats_t *st = h264_depack_stats(s_v.dep);
+    uint64_t now = app_now_ms();
+
+    if (resync_on_loss(&s_v.rs, now)) {
+        printf("[video] resync start: gap=%u audrop=%u\n", st->gap, st->au_dropped);
+        fflush(stdout);
+        request_keyframe();
+    }
+}
+
+/*---------------------------------------------------------------------------
  * 收 RTP
  *---------------------------------------------------------------------------*/
-void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts)
+void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts, uint16_t seq)
 {
     if (!s_v.opened || !s_v.dep || !payload || len <= 0) return;
 
-    h264_depack_push(s_v.dep, payload, len, ts);
+    const h264_depack_stats_t *st = h264_depack_stats(s_v.dep);
+
+    h264_depack_push(s_v.dep, payload, len, ts, seq);
+
+    /* 序号断了 / 整帧被判数据不全 → 进入等待 */
+    if (st->gap != s_v.gap_seen || st->au_dropped != s_v.drop_seen) {
+        s_v.gap_seen  = st->gap;
+        s_v.drop_seen = st->au_dropped;
+        if (s_v.rs.enabled) on_loss_detected();
+    }
+
+    /* 等待期间周期性重发 PLI —— PLI 走 UDP，本身也会丢 */
+    if (resync_tick(&s_v.rs, app_now_ms())) request_keyframe();
 
     const uint8_t *au = NULL;
     uint32_t au_ts = 0;
+    bool has_idr = false;
     int au_len;
-    while ((au_len = h264_depack_pop(s_v.dep, &au, &au_ts)) > 0) {
+    while ((au_len = h264_depack_pop(s_v.dep, &au, &au_ts, &has_idr)) > 0) {
         s_v.au_in++;
-        if (!s_v.dec) continue;          /* 只解包模式 */
+
+        /* --- 丢包恢复闸门 --- */
+        resync_action_t act = resync_gate(&s_v.rs, has_idr, app_now_ms());
+        if (s_v.debug)
+            fprintf(stderr, "[g] au=%u ts=%u idr=%d act=%d len=%d\n",
+                    s_v.au_in, au_ts, (int)has_idr, (int)act, au_len);
+        if (act == RESYNC_SKIP) continue;                /* 等 IDR：一帧都不解 */
+        if (act == RESYNC_GIVEUP) {
+            printf("[video] resync timeout: 等 IDR 超过 %u ms，放弃等待"
+               "（画面会不完整，但至少是动的）\n", s_v.rs.giveup_ms);
+            fflush(stdout);
+        } else if (act == RESYNC_RESUME) {
+            vdec_flush(s_v.dec);        /* 甩掉错误状态的参考帧，从 I 帧重新来 */
+            printf("[video] resync done: skipped=%u waited=%llums\n",
+                   s_v.rs.last_skipped, (unsigned long long)s_v.rs.last_wait_ms);
+            fflush(stdout);
+        }
+
+        if (!s_v.dec) { s_v.frames++; continue; }         /* 只解包模式 */
 
         vdec_feed(s_v.dec, au, au_len, (int64_t)au_ts);
 
@@ -410,10 +548,15 @@ void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts)
         int r;
         while ((r = vdec_get(s_v.dec, &f)) > 0) {
             s_v.dec_total++;
+            if (s_v.debug)
+                fprintf(stderr, "[f] dec=%u au=%u ts=%u act=%d idr=%d len=%d\n",
+                        s_v.dec_total, s_v.au_in, au_ts, (int)act, (int)has_idr, au_len);
+            frame_log(&f, s_v.dec_total);
             if (s_v.sink == VSINK_FILE)      sink_write_frame(&f);
             else if (s_v.sink == VSINK_DISP) sink_disp_frame(&f, s_v.dec_total);
             else                             s_v.frames++;
         }
+        if (r < 0) on_loss_detected();        /* 解码器也报错了 */
     }
 }
 
@@ -434,6 +577,7 @@ void app_video_stats_print(const char *why)
            ds->pkt_in, ds->au_done, ds->nal_done, ds->stap_pkt, ds->fu_seq);
     printf(" drop{type=%u,big=%u,slow=%u} fu_broken=%u",
            ds->drop_type, ds->drop_oversize, ds->drop_slow, ds->fu_broken);
+    printf(" gap=%u au_dropped=%u", ds->gap, ds->au_dropped);
     if (vs) printf(" dec{fed=%u,frame=%u,err=%u}", vs->fed, vs->frames, vs->errors);
     if (s_v.w) printf(" %ux%u", s_v.w, s_v.h);
     printf(" sink_frames=%u", s_v.frames);
@@ -441,4 +585,13 @@ void app_video_stats_print(const char *why)
         printf(" disp{shown=%u,replace=%u,drop=%u}",
                s_v.disp_frames, s_v.replace, s_v.drop_busy);
     printf("\n");
+
+    /* 恢复相关单独一行：丢几次、跳了多少帧、最坏一次等多久。
+       这几个数决定了"用户看到的是卡顿还是糊成一片"。 */
+    if (s_v.rs.enabled) {
+        printf("[video] resync stats(%s) 事件=%u 恢复=%u 跳过帧=%u 最坏等待=%llums"
+               " 放弃=%u PLI请求=%u\n",
+               why ? why : "", s_v.rs.events, s_v.rs.resumed, s_v.rs.skipped,
+               (unsigned long long)s_v.rs.max_wait_ms, s_v.rs.gave_up, s_v.pli_sent);
+    }
 }

@@ -14,6 +14,8 @@
 #   make duo-video  视频接收链路：ffmpeg 推 RTP → 室内机解包/解码/落盘 → 与参考 YUV 比对
 #   make duo-disp   视频上屏链路：解码 → RGB565 缩放 → LVGL 绘制 → 抓屏逐像素比对
 #   make ut         自研代码单元测试（零依赖，PC 与板子同一份）
+#   make loss       丢包恢复验收：注入丢包 + 逐帧 CRC 核对（含"关恢复"对照组）
+#   make release    发布打包：UT → 发布构建（strip）→ dist/ 出 tar.gz + sha256
 #   make rebuild    全量重编
 #   make clean      删构建目录
 #   make help       显示帮助
@@ -30,7 +32,7 @@ endif
 
 DEV := $(BASH) scripts/dev.sh
 
-.PHONY: all build run rebuild stats stress mem64 mem debug longrun duo duo-video duo-disp ut clean help
+.PHONY: all build run rebuild stats stress mem64 mem debug longrun duo duo-video duo-disp ut loss release clean help
 
 all: build run
 
@@ -73,6 +75,12 @@ duo-disp:
 
 ut:
 	@$(DEV) ut
+
+loss:
+	@$(BASH) scripts/loss_test.sh $(SEC)
+
+release:
+	@$(BASH) scripts/release.sh
 
 clean:
 	@$(DEV) clean
