@@ -256,6 +256,7 @@ static void tick_cb(lv_timer_t *t)
     /* 计时：接通后走通话时长；还没接通但已呼出/被呼，走响铃时长（灰色提示）。
        通话开始的一瞬 call_seconds() 从 0 变正，计时标签自动无缝衔接。 */
     int sec = call_seconds();
+    int elapsed = sec;
     char b[32];
     if (sec > 0) {
         fmt_time(b, sizeof(b), sec);
@@ -263,8 +264,8 @@ static void tick_cb(lv_timer_t *t)
         lv_label_set_text(s_timer_lbl, b);
         lv_label_set_text(s_hint_lbl, "通话中");
     } else if (s_ring_start) {
-        int rs = (int)((lv_tick_get() - s_ring_start) / 1000u);
-        fmt_time(b, sizeof(b), rs);
+        elapsed = (int)((lv_tick_get() - s_ring_start) / 1000u);
+        fmt_time(b, sizeof(b), elapsed);
         lv_obj_set_style_text_color(s_timer_lbl, lv_color_hex(0x6E7B8A), 0);
         lv_label_set_text(s_timer_lbl, b);
         /* 接听键还在 = 对方打来的正在响；被藏了 = 我方呼出的等应答 */
@@ -284,9 +285,10 @@ static void tick_cb(lv_timer_t *t)
     lv_label_set_text(s_stat_lbl, s);
 
     /* 纯语音通话的抓屏入口：没有视频帧就永远走不到 on_video_frame 里的
-       抓屏触发，这里按"接通后第 SHOT_AT 秒"补一个触发点（默认 3s）。 */
+       抓屏触发，这里按"页面出现第 SHOT_AT 秒"补一个触发点（默认 3s）。
+       用 elapsed 而不是 sec：响铃期也能抓，排"来电页"布局问题正靠它。 */
     if (s_shot_path[0] && !s_shot_done && !s_shot_timer &&
-        !video_negotiated() && sec >= (s_shot_at > 0 ? s_shot_at : 3)) {
+        !video_negotiated() && elapsed >= (s_shot_at > 0 ? s_shot_at : 3)) {
         s_shot_done = true;
         s_shot_timer = lv_timer_create(shot_timer_cb, 80, NULL);
     }
@@ -488,10 +490,11 @@ static void on_sip_state(const app_event_t *e, void *user)
         if (!s_scr) return;
         if (!s_ring_start) s_ring_start = lv_tick_get();
         lv_label_set_text(s_name_lbl, peer_name());
-        lv_label_set_text(s_hint_lbl, "来电呼叫");
         lv_label_set_text(s_timer_lbl, "");
-        lv_label_set_text(s_stat_lbl, "");
         lv_obj_set_hidden(s_btn_answer, false);
+        /* tick 必须在响铃期就跑：响铃计时、纯语音态的抓屏触发都在它里面，
+           之前只在通话中才建，来电页就永远是静态的"来电呼叫" */
+        if (!s_tick) s_tick = lv_timer_create(tick_cb, 500, NULL);
         return;
     }
 

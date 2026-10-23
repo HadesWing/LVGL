@@ -218,7 +218,23 @@ const char *app_sip_peer_name(void) { return s_call.peer; }
 
 bool app_sip_registered(void) { return s_registered; }
 
-bool app_sip_video_negotiated(void) { return s_call.video_on; }
+bool app_sip_video_negotiated(void)
+{
+    /* 按"页面此刻该不该显示视频区"给答案，而不是只看通道建没建：
+     *   通话中   —— video_on：双方端口真的握上了才算；
+     *   来电响铃 —— 通道要等应答才建立，此时按对端 offer 的 m=video 端口预判：
+     *               有端口 = 对端打算发视频，显示"等待画面"；
+     *               没有   = 纯语音 INVITE，显示"纯语音通话"；
+     *   呼出中   —— 我方 INVITE 的 offer 带了视频端口（视频资源开出来了）就按
+     *               "有视频"走，不然呼出页会闪"纯语音通话"误导人。 */
+    if (s_state == SIP_INCALL)
+        return s_call.video_on;
+    if (s_state == SIP_INCOMING)
+        return s_call.rtp_remote_v != 0;
+    if (s_state == SIP_RINGING)
+        return s_call.outgoing && s_call.rtp_local_v != 0;
+    return false;
+}
 
 int app_sip_call_seconds(void)
 {
