@@ -94,7 +94,7 @@ NDROP=0
 for r in $DROP_SPEC; do NDROP=$((NDROP + 1)); done
 
 # =============================================================================
-# 跑一遍。$1 = on / off（是否启用丢包恢复）
+# 跑一遍。$1 = on / off / nack（是否启用丢包恢复；nack = 走 NACK 重传代理）
 # =============================================================================
 run_case() {
     local mode=$1
@@ -138,9 +138,17 @@ run_case() {
     [ -z "$VPORT" ] && { echo "室内机没开视频端口"; grep -E "video" "$LOG" | head; return 1; }
 
     # ---------- 丢包注入代理 ----------
-    $PY "$SELF_DIR/scripts/udp_loss.py" \
-        --listen "127.0.0.1:$PROXY_PORT" --to "127.0.0.1:$VPORT" \
-        $DROP_ARGS --timeout 3 > "$PROXYLOG" 2>&1 &
+    # nack 模式用 nack_proxy.py：除了注入丢包，还监听 RTCP（RTP+1 口），
+    # 收到室内机的 Generic NACK 就从缓存重发缺的包 —— 扮演支持 RTX 的门口机。
+    if [ "$mode" = "nack" ]; then
+        $PY "$SELF_DIR/scripts/nack_proxy.py" \
+            --listen "127.0.0.1:$PROXY_PORT" --to "127.0.0.1:$VPORT" \
+            $DROP_ARGS --timeout 3 > "$PROXYLOG" 2>&1 &
+    else
+        $PY "$SELF_DIR/scripts/udp_loss.py" \
+            --listen "127.0.0.1:$PROXY_PORT" --to "127.0.0.1:$VPORT" \
+            $DROP_ARGS --timeout 3 > "$PROXYLOG" 2>&1 &
+    fi
     PIDS="$PIDS $!"
     wait_log "$PROXYLOG" "ready" 10 || { echo "注入器起不来"; cat "$PROXYLOG"; return 1; }
 
@@ -178,11 +186,28 @@ echo ""
 RC_ON=$?
 cat loss_on.report
 
+RC_NACK=0
+if [ "${NACK:-0}" = "1" ]; then
+    echo ""
+    echo "──── 第三遍：NACK 重传（期望 0 脏帧 + 无跳帧 + 重传全部补上）────"
+    run_case nack || exit 1
+    echo ""
+    "$PY" "$SELF_DIR/scripts/loss_analyze.py" --mode nack \
+        --log loss_nack.log --framelog loss_nack.crc --ref "$REF" --size "$SIZE" \
+        --min-events $NDROP > loss_nack.report 2>&1
+    RC_NACK=$?
+    cat loss_nack.report
+fi
+
 echo ""
 echo "════ 总判定 ════"
 echo "  关恢复: $([ $RC_OFF -eq 0 ] && echo '✅ 符合预期（出现脏帧，说明注入有效）' || echo '❌ 不符合预期')"
 echo "  开恢复: $([ $RC_ON  -eq 0 ] && echo '✅ 符合预期（0 脏帧，恢复及时）' || echo '❌ 不符合预期')"
+[ "${NACK:-0}" = "1" ] && \
+echo "  NACK:   $([ $RC_NACK -eq 0 ] && echo '✅ 符合预期（重传补洞，全程无感）' || echo '❌ 不符合预期')"
 echo ""
-echo "详细报告：$BIN/loss_off.report、$BIN/loss_on.report"
+echo "详细报告：$BIN/loss_off.report、$BIN/loss_on.report${NACK:+、$BIN/loss_nack.report}"
 
-[ $RC_OFF -eq 0 ] && [ $RC_ON -eq 0 ] && exit 0 || exit 1
+OK=$([ $RC_OFF -eq 0 ] && [ $RC_ON -eq 0 ] && echo 1 || echo 0)
+[ "${NACK:-0}" = "1" ] && [ $RC_NACK -ne 0 ] && OK=0
+[ "$OK" = "1" ] && exit 0 || exit 1

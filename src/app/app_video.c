@@ -28,6 +28,7 @@
 #include "crc32.h"
 #include "h264_depack.h"
 #include "resync.h"
+#include "rtp_reorder.h"
 #include "vdec.h"
 #include "yuv2rgb.h"
 
@@ -88,6 +89,14 @@ static struct {
     char             flog_path[256];
     uint32_t         pli_sent;     /* 通过回调发出的关键帧请求数 */
     void           (*key_req_cb)(void);
+    void           (*nack_req_cb)(uint16_t seq);   /* NACK：请求重传某个序号 */
+
+    /* --- 按序化 + NACK（加速层，resync 之下） --- */
+    rtp_reorder_t   *ro;
+    uint32_t         ro_ms;       /* 重排等待（0 = 关） */
+    bool             nack_on;
+    uint32_t         nack_ms;
+    int              nack_max;
 
     /* --- 上屏 --- */
     int              box_w, box_h;
@@ -116,15 +125,20 @@ static void slot_unlock(void) { app_lock_give(&s_v.lock); }
  *---------------------------------------------------------------------------*/
 static void route_parse_env(void)
 {
-    s_v.sink = VSINK_DROP;
+    /* 默认 = disp（上屏）：这是产品本来的样子 —— 室内机收到视频就该显示。
+     * 曾经默认是 drop（留给 CI 的"纯语音"姿态），结果所有测试脚本都显式
+     * 传了 disp/file，测试全绿；人工起程序却永远"等待画面"，连视频端口
+     * 都不 bind（SDP 回 m=video 0，对端根本不发视频）。
+     * 教训：**默认值要跟产品行为一致，测试环境去显式关**，而不是反过来。 */
+    s_v.sink = VSINK_DISP;
     const char *k = getenv("SIP_VIDEO_SINK");
     if (k && *k) {
         if      (!strcmp(k, "file")) s_v.sink = VSINK_FILE;
         else if (!strcmp(k, "disp")) s_v.sink = VSINK_DISP;
         else if (!strcmp(k, "drop")) s_v.sink = VSINK_DROP;
         else {
-            printf("[video] SIP_VIDEO_SINK=%s 不认识，按 drop 处理\n", k);
-            s_v.sink = VSINK_DROP;
+            printf("[video] SIP_VIDEO_SINK=%s 不认识，按 disp 处理\n", k);
+            s_v.sink = VSINK_DISP;
         }
     }
 
@@ -151,6 +165,30 @@ static void route_parse_env(void)
 
     const char *lg = getenv("SIP_VIDEO_FRAME_LOG");
     snprintf(s_v.flog_path, sizeof(s_v.flog_path), "%s", (lg && *lg) ? lg : "");
+
+    /* --- 按序化 + NACK（见 rtp_reorder.h 的分层说明） --- */
+    s_v.ro_ms = 20;                                   /* 局域网 RTT 1~5ms，20ms 很宽裕 */
+    const char *rms = getenv("SIP_VIDEO_REORDER_MS");
+    if (rms && *rms) s_v.ro_ms = (uint32_t)strtoul(rms, NULL, 10);
+
+    s_v.nack_on = true;
+    const char *nk = getenv("SIP_VIDEO_NACK");
+    if (nk && !strcmp(nk, "0")) s_v.nack_on = false;
+
+    s_v.nack_ms = 8;
+    const char *nms = getenv("SIP_VIDEO_NACK_MS");
+    if (nms && *nms) s_v.nack_ms = (uint32_t)strtoul(nms, NULL, 10);
+
+    s_v.nack_max = 3;
+    const char *nmr = getenv("SIP_VIDEO_NACK_RETRY");
+    if (nmr && *nmr) s_v.nack_max = (int)strtol(nmr, NULL, 10);
+}
+
+/* reorder 的洞回调 → 转发给 SIP 层发 NACK。只做一次转手，不在热路径上干重活。 */
+static void reorder_nack_cb(uint16_t seq, void *user)
+{
+    (void)user;
+    if (s_v.nack_req_cb) s_v.nack_req_cb(seq);
 }
 
 const char *app_video_route_desc(void)
@@ -220,7 +258,7 @@ bool app_video_open(void)
 
     if (s_v.box_w <= 0) app_video_set_box(288, 216);
 
-    /* drop 模式什么都不用开 —— 通话只有声音，这是默认状态 */
+    /* drop 模式什么都不用开 —— 显式声明"这通电话不要视频" */
     if (s_v.sink == VSINK_DROP && !s_v.nodec) {
         s_v.opened = true;
         return true;
@@ -233,6 +271,20 @@ bool app_video_open(void)
     }
     s_v.gap_seen  = h264_depack_stats(s_v.dep)->gap;
     s_v.drop_seen = h264_depack_stats(s_v.dep)->au_dropped;
+
+    /* 按序化缓冲：NACK 重传包"一定迟到"，没有这个按序交付点，重传
+       补进来的包会被 depack 当成新的序号断档，越补越花（见 rtp_reorder.h）。 */
+    if (s_v.ro_ms > 0) {
+        s_v.ro = rtp_reorder_new(64, s_v.ro_ms);
+        if (s_v.ro) {
+            rtp_reorder_set_nack_policy(s_v.ro, s_v.nack_on, s_v.nack_ms, s_v.nack_max);
+            rtp_reorder_set_nack_cb(s_v.ro, reorder_nack_cb, NULL);
+            printf("[video] reorder: hold=%ums nack=%s(%ums x%d)\n",
+                   s_v.ro_ms, s_v.nack_on ? "on" : "off", s_v.nack_ms, s_v.nack_max);
+        } else {
+            printf("[video] 重排缓冲分配失败，退化为直通（丢包恢复走慢路径）\n");
+        }
+    }
 
     if (!s_v.nodec) {
         if (!vdec_available()) {
@@ -305,6 +357,10 @@ void app_video_close(void)
         h264_depack_free(s_v.dep);
         s_v.dep = NULL;
     }
+    if (s_v.ro) {
+        rtp_reorder_free(s_v.ro);
+        s_v.ro = NULL;
+    }
 
     /* 槽位缓冲保留，只把状态复位。
      *
@@ -321,6 +377,7 @@ void app_video_close(void)
     printf("[video] closed (%u 帧, %.1f MB%s)\n",
            s_v.frames, (double)s_v.bytes / (1024.0 * 1024.0),
            s_v.sink == VSINK_DISP ? "，上屏" : "");
+    fflush(stdout);            /* Windows CRT 重定向后是全缓冲，见 stats_print 的说明 */
     s_v.opened = false;
 }
 
@@ -329,6 +386,11 @@ bool app_video_is_open(void) { return s_v.opened; }
 void app_video_set_key_req_cb(void (*cb)(void))
 {
     s_v.key_req_cb = cb;
+}
+
+void app_video_set_nack_cb(void (*cb)(uint16_t seq))
+{
+    s_v.nack_req_cb = cb;
 }
 
 bool app_video_wants_rx(void)
@@ -498,24 +560,13 @@ static void on_loss_detected(void)
 /*---------------------------------------------------------------------------
  * 收 RTP
  *---------------------------------------------------------------------------*/
-void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts, uint16_t seq)
+/* 把 depack 里完成的 AU 全部取走，走闸门 → 解码 → sink。
+   每喂一个包就要调一次：depack 的 done 槽只有一格，一次 push 跨过 AU 边界
+   就会产生一个新完成帧；不立刻取走，下一个完成的 AU 会把它顶掉
+   （drop_slow）—— reorder 批量交付时第一版就栽在这里：一个 drain 突发
+   跨了 2 个 AU 边界，静默丢了 3 帧，参考链一直烂到 IDR。 */
+static void pump_aus(void)
 {
-    if (!s_v.opened || !s_v.dep || !payload || len <= 0) return;
-
-    const h264_depack_stats_t *st = h264_depack_stats(s_v.dep);
-
-    h264_depack_push(s_v.dep, payload, len, ts, seq);
-
-    /* 序号断了 / 整帧被判数据不全 → 进入等待 */
-    if (st->gap != s_v.gap_seen || st->au_dropped != s_v.drop_seen) {
-        s_v.gap_seen  = st->gap;
-        s_v.drop_seen = st->au_dropped;
-        if (s_v.rs.enabled) on_loss_detected();
-    }
-
-    /* 等待期间周期性重发 PLI —— PLI 走 UDP，本身也会丢 */
-    if (resync_tick(&s_v.rs, app_now_ms())) request_keyframe();
-
     const uint8_t *au = NULL;
     uint32_t au_ts = 0;
     bool has_idr = false;
@@ -560,6 +611,68 @@ void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts, uint16_t seq
     }
 }
 
+/* 丢包检测 + PLI 周期重发。
+   必须在 pump_aus **之前**调：gap 后的第一个干净 AU 如果在 resync 激活前
+   被喂给解码器，参考链（上一帧被判丢）已经断了，解出来就是脏帧 ——
+   这正是 resync 要拦的东西，顺序反了等于白拦。 */
+static void check_loss(void)
+{
+    const h264_depack_stats_t *st = h264_depack_stats(s_v.dep);
+
+    /* 序号断了 / 整帧被判数据不全 → 进入等待 */
+    if (st->gap != s_v.gap_seen || st->au_dropped != s_v.drop_seen) {
+        s_v.gap_seen  = st->gap;
+        s_v.drop_seen = st->au_dropped;
+        if (s_v.rs.enabled) on_loss_detected();
+    }
+
+    /* 等待期间周期性重发 PLI —— PLI 走 UDP，本身也会丢 */
+    if (resync_tick(&s_v.rs, app_now_ms())) request_keyframe();
+}
+
+/* 把 reorder 里按序就绪的包全部喂给 depack。
+   有 reorder 时这是 depack 的唯一入口 —— 保证 depack 看到的永远按序。
+   关键：**每交付一个包就 ① 查丢包 ② pump 一次 AU**，别攒一批再喂：
+   攒批会让 done 槽被顶掉（丢帧），还会让 resync 晚一拍激活。 */
+static void drain_reorder(void)
+{
+    if (!s_v.ro) return;
+    uint64_t now = app_now_ms();
+    uint16_t seq;
+    uint32_t ts;
+    const uint8_t *pl;
+    int n;
+    while ((n = rtp_reorder_pop(s_v.ro, &seq, &ts, &pl, now)) > 0) {
+        h264_depack_push(s_v.dep, pl, n, ts, seq);
+        check_loss();
+        pump_aus();
+    }
+}
+
+void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts, uint16_t seq)
+{
+    if (!s_v.opened || !s_v.dep || !payload || len <= 0) return;
+
+    if (s_v.ro) {
+        /* 洞在这里登记并当场发 NACK；重传在窗口内补上 → 下游根本看不到 gap */
+        rtp_reorder_push(s_v.ro, seq, ts, payload, len, app_now_ms());
+        drain_reorder();
+    } else {
+        h264_depack_push(s_v.dep, payload, len, ts, seq);
+        check_loss();
+        pump_aus();
+    }
+}
+
+void app_video_tick(void)
+{
+    if (!s_v.opened || !s_v.ro) return;
+    /* 没有新包也要推时钟：洞超时放行、NACK 重发都是时间驱动的。
+       不推的话，"推流方停了 + 有洞"的组合会把后面的包永远攥在手里。 */
+    rtp_reorder_tick(s_v.ro, app_now_ms());
+    drain_reorder();
+}
+
 /*---------------------------------------------------------------------------
  * 统计
  *---------------------------------------------------------------------------*/
@@ -594,4 +707,17 @@ void app_video_stats_print(const char *why)
                why ? why : "", s_v.rs.events, s_v.rs.resumed, s_v.rs.skipped,
                (unsigned long long)s_v.rs.max_wait_ms, s_v.rs.gave_up, s_v.pli_sent);
     }
+
+    /* 重排/NACK 单独一行：filled 是"重传救回来的包数"，gap_pkts 是
+       "重传没救回来、交给慢路径的包数" —— 这两个数的比例就是 NACK 的价值。 */
+    if (s_v.ro) {
+        const rtp_reorder_stats_t *rs = rtp_reorder_stats(s_v.ro);
+        printf("[video] ro stats(%s) filled=%u gap=%u nack=%u dup=%u late=%u"
+               " full=%u big=%u reset=%u\n",
+               why ? why : "", rs->filled, rs->gap_pkts, rs->nacks,
+               rs->dup, rs->late, rs->full, rs->oversize, rs->reset);
+    }
+    /* Windows CRT 忽略 _IOLBF（重定向后实际是全缓冲）：不在这里 flush，
+       进程被 kill -9 时这行就丢了 —— 分析器会误判"重排没开"。 */
+    fflush(stdout);
 }

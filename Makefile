@@ -32,7 +32,7 @@ endif
 
 DEV := $(BASH) scripts/dev.sh
 
-.PHONY: all build run rebuild stats stress mem64 mem debug longrun duo duo-video duo-disp ut loss release clean help
+.PHONY: all build run rebuild stats stress mem64 mem debug longrun duo duo-video duo-disp ut loss loss-nack release clean help
 
 all: build run
 
@@ -78,6 +78,10 @@ ut:
 
 loss:
 	@$(BASH) scripts/loss_test.sh $(SEC)
+
+# 在 loss 的基础上加第三遍：NACK 重传闭环（nack_proxy.py 扮演支持 RTX 的门口机）
+loss-nack:
+	@NACK=1 $(BASH) scripts/loss_test.sh $(SEC)
 
 release:
 	@$(BASH) scripts/release.sh

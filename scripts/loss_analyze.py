@@ -90,10 +90,26 @@ def parse_resync(text):
             "pli":      int(m.group(6)),
         }
     m = re.search(r"\[rtp\] video stats\(\w*\) pkt=(\d+) pt_bad=(\d+) "
-                  r"last_ts=(\d+) pli=(\d+)", text)
+                  r"last_ts=(\d+) pli=(\d+)(?: nack=(\d+))?", text)
     if m:
         info["rtp_pkt"] = int(m.group(1))
         info["rtp_pli"] = int(m.group(4))
+        info["rtp_nack"] = int(m.group(5)) if m.group(5) else 0
+
+    # 重排/NACK 层（rtp_reorder）：filled=重传补上的包，gap=判丢交给慢路径的包
+    m = re.search(r"\[video\] ro stats\(\w*\) filled=(\d+) gap=(\d+) nack=(\d+) "
+                  r"dup=(\d+) late=(\d+) full=(\d+) big=(\d+) reset=(\d+)", text)
+    if m:
+        info["ro"] = {
+            "filled": int(m.group(1)),
+            "gap":    int(m.group(2)),
+            "nack":   int(m.group(3)),
+            "dup":    int(m.group(4)),
+            "late":   int(m.group(5)),
+            "full":   int(m.group(6)),
+            "big":    int(m.group(7)),
+            "reset":  int(m.group(8)),
+        }
 
     # 汇总行可能缺失：进程被强杀时，最后几行可能还在缓冲区里没落盘
     # （stdout 重定向到文件时是全缓冲 —— 已在 main.c 改成行缓冲，
@@ -118,8 +134,9 @@ def main():
     ap.add_argument("--framelog", required=True, help="帧 CRC 日志（SIP_VIDEO_FRAME_LOG）")
     ap.add_argument("--ref", required=True, help="参考 YUV（YUV420P 裸流）")
     ap.add_argument("--size", default="640x480")
-    ap.add_argument("--mode", choices=["on", "off"], default="on",
-                    help="on=开了恢复（判据严格）；off=对照实验（期望有脏帧）")
+    ap.add_argument("--mode", choices=["on", "off", "nack"], default="on",
+                    help="on=开了恢复（判据严格）；off=对照实验（期望有脏帧）；"
+                         "nack=重传补洞（0 脏帧且全程无感）")
     ap.add_argument("--min-events", type=int, default=1,
                     help="至少应有的丢包事件数（等于注入的丢包次数）")
     ap.add_argument("--max-diff", type=int, default=12,
@@ -215,6 +232,13 @@ def main():
 
     if info.get("rtp_pli"):
         print(f"RTP 侧记录的 PLI 实际发出 {info['rtp_pli']} 个")
+    if info.get("rtp_nack"):
+        print(f"RTP 侧记录的 NACK 实际发出 {info['rtp_nack']} 个")
+    if info.get("ro"):
+        r = info["ro"]
+        print(f"重排/NACK 层：重传补上 {r['filled']} 包，判丢 {r['gap']} 包，"
+              f"请求 {r['nack']} 次，重复 {r['dup']}，迟到 {r['late']}，"
+              f"满弃 {r['full']}，流重启 {r['reset']}")
 
     # --- 判据 ---
     print()
@@ -228,7 +252,29 @@ def main():
         if not cond:
             ok = False
 
-    if args.mode == "on":
+    if args.mode == "nack":
+        # NACK 生效的标志：丢的包全被重传补上 —— 慢路径（resync/PLI）根本不该被惊动
+        ro = info.get("ro")
+        chk(ro is not None, "日志里有重排/NACK 统计", "没有 ro 统计 —— 重排缓冲没开？")
+        if ro:
+            chk(ro["filled"] >= args.min_events,
+                f"重传补上了 {ro['filled']} 个包（注入生效且 NACK 闭环成功）",
+                f"只补上 {ro['filled']} 包，少于注入的 {args.min_events} 段 —— "
+                f"NACK 闭环没走通（代理没收到 NACK？缓存没命中？）")
+            chk(ro["gap"] == 0,
+                "没有包被判丢（20ms 窗口内全部补上，慢路径零惊动）",
+                f"{ro['gap']} 个包被判丢 —— 重传比 hold 窗口慢，退到了 PLI 路径")
+            chk(events == 0,
+                "resync 慢路径全程没被触发（单包丢失无感）",
+                f"resync 触发了 {events} 次 —— NACK 没能拦住丢包")
+        chk(len(dirty) == 0, "写出的每一帧都完好（0 个脏帧）",
+            f"{len(dirty)} 个脏帧被写出去")
+        chk(not backwards, "帧号严格递增（没有拼错顺序）",
+            "帧号有回退，解包顺序有问题")
+        chk(jumps == 0,
+            "参考帧号连续（每一帧都在 —— 用户全程无感）",
+            f"中途跳过 {jumps} 段帧 —— 有帧没能救回来，走了跳帧")
+    elif args.mode == "on":
         chk(len(dirty) == 0, "写出的每一帧都完好（0 个脏帧）",
             f"{len(dirty)} 个脏帧被写出去 —— 恢复策略没拦住被污染的帧")
         chk(events >= args.min_events,

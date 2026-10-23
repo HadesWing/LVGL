@@ -8,9 +8,9 @@
  *   视频这边更极端：目标板上根本还没写 fbdev/VPU，但解码正确性现在就能验。
  *
  * 【接收方向的三条出口】
- *   SIP_VIDEO_SINK=drop  什么也不做（默认，通话只有声音）
+ *   SIP_VIDEO_SINK=disp  解码 → YUV420P→RGB565 缩放 → 交给 LVGL 上屏（默认）
  *   SIP_VIDEO_SINK=file  解码后落盘成裸 YUV420P，用来和参考帧逐字节比对
- *   SIP_VIDEO_SINK=disp  解码 → YUV420P→RGB565 缩放 → 交给 LVGL 上屏
+ *   SIP_VIDEO_SINK=drop  什么也不做（显式声明这通电话不要视频，不 bind 视频端口）
  *
  * 【上屏为什么要经过"槽位"】
  *   解码在 RTP 线程，LVGL 只能在主线程碰（官方红线）。
@@ -23,10 +23,16 @@
  * 【丢包恢复】（这一版的重点）
  *   见 src/media/resync.h。要点：丢一个包就要整帧丢弃并停手，
  *   然后发 RTCP PLI 请求关键帧，收到 IDR 才恢复上屏。
- *   参数：
- *     SIP_VIDEO_RESYNC = 0          关掉（对照实验用）
+ *   在 resync 之下还有一层"加速层"：rtp_reorder 按序化缓冲 + RTCP NACK
+ *   重传请求（见 src/media/rtp_reorder.h）—— 单包丢失在 20ms 窗口内被
+ *   重传补上，根本不会走到"整帧丢弃 + 等 IDR"那一步。参数：
+ *     SIP_VIDEO_RESYNC = 0          关掉慢路径（对照实验用）
  *     SIP_VIDEO_PLI_MS = 500        等待期间多久重发一次 PLI
  *     SIP_VIDEO_RESYNC_TIMEOUT = 3  等多少秒还没 IDR 就放弃（单位秒，0 = 一直等）
+ *     SIP_VIDEO_REORDER_MS = 20     重排缓冲等多久（0 = 关掉按序化）
+ *     SIP_VIDEO_NACK = 0            关掉重传请求（默认开）
+ *     SIP_VIDEO_NACK_MS = 40        重传请求多久没补上就重发
+ *     SIP_VIDEO_NACK_RETRY = 5      每个洞最多请求几次
  *     SIP_VIDEO_FRAME_LOG = <路径>  每帧写一行 CRC，供 scripts/loss_verify.py 比对
  *
  * 【发送方向不存在】
@@ -41,7 +47,7 @@
 
 /**
  * 按环境变量解析路由并打开资源：
- *   SIP_VIDEO_SINK = disp | file | drop     （默认 drop：不处理视频，通话只有声音）
+ *   SIP_VIDEO_SINK = disp | file | drop     （默认 disp：收到视频就上屏 —— 默认值要跟产品行为一致）
  *   SIP_VIDEO_SINK_FILE = <路径>             （默认 video_rx.yuv）
  *   SIP_VIDEO_NODEC = 1                     只做 RTP 重组、不解码（分离"收包"和"解码"两个问题）
  *
@@ -59,15 +65,27 @@ bool app_video_wants_rx(void);
  * 收一个 RTP 视频 payload（不含 RTP 头）。
  * ts 是 RTP 时间戳（90 kHz），用来判 AU 边界。
  * seq 是 RTP 序号 —— **必须传**，它是"丢了包没有"的唯一判据。
- * **在 RTP 线程调用**，内部会做解码和转换，最后 post 事件让主线程取画面。
+ * **在 RTP 线程调用**，内部会做按序化、解码和转换，最后 post 事件让主线程取画面。
  */
 void app_video_on_rtp(const uint8_t *payload, int len, uint32_t ts, uint16_t seq);
+
+/**
+ * 无包时的时钟驱动：重排缓冲的洞超时放行、NACK 重发都靠它推进。
+ * 收包循环的固定 tick（20ms）里调一次，通话外调了也没副作用。
+ */
+void app_video_tick(void);
 
 /**
  * 注册"请求关键帧"回调（由 SIP/RTP 层提供，内部发 RTCP PLI）。
  * 只在通话期间有效，挂断时传 NULL 清掉。
  */
 void app_video_set_key_req_cb(void (*cb)(void));
+
+/**
+ * 注册"请求重传"回调（由 SIP/RTP 层提供，内部发 RTCP Generic NACK）。
+ * 参数是缺失的 RTP 序号。挂断时传 NULL 清掉。
+ */
+void app_video_set_nack_cb(void (*cb)(uint16_t seq));
 
 /**
  * 上屏目标框（不含边框）。UI 建好视频控件后调用一次，转换时按这个框等比缩放。

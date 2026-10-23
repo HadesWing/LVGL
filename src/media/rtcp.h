@@ -27,6 +27,18 @@
  *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  *
  *   FMT=1（PLI）、PT=206（PSFB）、length = 2（单位是 32bit 字减一 → 12 字节）
+ *
+ * 【Generic NACK（RFC 4585 §6.2.1）】同族的另一员，PT=205（RTPFB）、FMT=1：
+ *
+ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *    |            PID                |            BLP                |
+ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *
+ *   PID = 丢的第一个序号，BLP = 后续 16 个序号的丢失位图
+ *   （bit i 置 1 = 序号 PID+1+i 也丢了 —— 注意跳过 PID+1 本身？不：
+ *     bit0 对应 PID+1，bit15 对应 PID+16，见 RFC 4585 §6.2.1 原文）。
+ *   一个 FCI 最多报 17 个洞；本实现一次报一个（BLP=0），连洞靠多次调用 ——
+ *   字节多点、逻辑简单，对 8 包以内的局域网丢失完全够用。
  */
 #ifndef RTCP_H
 #define RTCP_H
@@ -34,6 +46,7 @@
 #include <stdint.h>
 
 #define RTCP_PLI_BYTES 12
+#define RTCP_NACK_BYTES 16
 
 /**
  * 拼一个 PLI 报文。
@@ -43,5 +56,12 @@
  * 返回写入的字节数（固定 12），缓冲不够返回 -1。
  */
 int rtcp_build_pli(uint8_t *out, int cap, uint32_t sender_ssrc, uint32_t media_ssrc);
+
+/**
+ * 拼一个 Generic NACK 报文（请求对端重传序号 pid；blp 是后续丢失位图，单洞传 0）。
+ * 返回写入的字节数（固定 16），缓冲不够返回 -1。
+ */
+int rtcp_build_nack(uint8_t *out, int cap, uint32_t sender_ssrc, uint32_t media_ssrc,
+                    uint16_t pid, uint16_t blp);
 
 #endif /* RTCP_H */

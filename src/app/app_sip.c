@@ -30,6 +30,7 @@
 #define RTCP_LOCAL_SSRC 0x494E444FUL    /* "INDO" */
 
 static void rtcp_send_pli(void);   /* 提前声明：rtp_start_media 里要注册它 */
+static void video_nack_request(uint16_t seq);   /* 同上：NACK 回调 */
 
 /* 注意顺序：WinSock 必须在 osip 之前（osip.h 里用到 struct timeval） */
 #ifdef _WIN32
@@ -153,6 +154,7 @@ static uint32_t s_v_pt_bad;      /* pt 不匹配被丢弃的包数 */
 static uint32_t s_v_last_ts;
 static uint32_t s_v_ssrc;        /* 对端视频 SSRC（发 PLI 要填） */
 static uint32_t s_v_pli;         /* 实际发出去的 PLI 次数 */
+static uint32_t s_v_nack;        /* 实际发出去的 NACK 次数 */
 
 static void rtp_send_frame(void);
 
@@ -426,6 +428,7 @@ static void rtp_start_media(void)
        （序号断了 / 整帧不全 / 解码器报错），而 RTCP 出口在 app_sip 手上。
        挂断时清掉，不留悬垂指针。 */
     app_video_set_key_req_cb(rtcp_send_pli);
+    app_video_set_nack_cb(video_nack_request);
     fflush(stdout);
 }
 
@@ -442,14 +445,15 @@ static void rtp_print_stats(const char *why)
     /* 视频单独一行：混在音频里会让人误以为"pps 50 就是全部正常"，
        而实际上视频可能一个包都没进来 */
     if (s_call.video_on || s_v_rx || s_v_pt_bad)
-        printf("[rtp] video stats(%s) pkt=%u pt_bad=%u last_ts=%u pli=%u\n",
-               why, s_v_rx, s_v_pt_bad, s_v_last_ts, s_v_pli);
+        printf("[rtp] video stats(%s) pkt=%u pt_bad=%u last_ts=%u pli=%u nack=%u\n",
+               why, s_v_rx, s_v_pt_bad, s_v_last_ts, s_v_pli, s_v_nack);
     fflush(stdout);
 }
 
 static void rtp_stop_media(void)
 {
     app_video_set_key_req_cb(NULL);
+    app_video_set_nack_cb(NULL);
     app_video_stats_print("hangup");
     app_video_close();
     app_audio_close();
@@ -884,6 +888,7 @@ static void call_reset(void)
     s_call.video_on      = false;
     s_call.rtp_remote_v  = 0;
     s_v_rx = s_v_pt_bad = 0;
+    s_v_nack = 0;
     s_v_last_ts = 0;
     s_v_ssrc = 0;
 }
@@ -1464,6 +1469,43 @@ static void rtcp_send_pli(void)
     s_v_pli++;
 }
 
+/*---------------------------------------------------------------------------
+ * 发 RTCP Generic NACK（RFC 4585 §6.2.1）：请求对端重传某个 RTP 包
+ *
+ * 和 PLI 的分工：PLI 说"参考链断了，给我个 I 帧"（代价 = 对端编一个 IDR）；
+ * NACK 说"序号 N 那个包没到，重发一下"（代价 = 对端从重传缓冲捞一个包）。
+ * 局域网丢包大多是单包丢失，NACK 一个 RTT 就补上，画面无感；
+ * 补不上（对端不响应/丢太多）才轮到 PLI 慢路径。
+ * 端口、容错策略与 PLI 完全一致：RTP+1，发送失败只计数不报错。
+ *---------------------------------------------------------------------------*/
+static void rtcp_send_nack(uint16_t seq)
+{
+    if (s_rtp_v == SOCK_INVALID || !s_call.rtp_remote_v || !s_call.remote_ip[0])
+        return;
+
+    uint8_t buf[RTCP_NACK_BYTES];
+    int n = rtcp_build_nack(buf, (int)sizeof(buf), RTCP_LOCAL_SSRC, s_v_ssrc, seq, 0);
+    if (n != RTCP_NACK_BYTES) return;
+
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family      = AF_INET;
+    to.sin_port        = htons((uint16_t)(s_call.rtp_remote_v + 1));
+    to.sin_addr.s_addr = inet_addr(s_call.remote_ip);
+
+    if (sendto(s_rtp_v, (const char *)buf, n, 0,
+               (struct sockaddr *)&to, sizeof(to)) < 0) {
+        /* 高频路径（每个洞首发 + 重发都走这里），失败别刷屏 */
+    }
+    s_v_nack++;
+}
+
+/* app_video 的洞回调只带序号 —— 转一手发 NACK */
+static void video_nack_request(uint16_t seq)
+{
+    rtcp_send_nack(seq);
+}
+
 static void rtp_video_on_readable(void)
 {
     static uint8_t vbuf[2048];
@@ -1504,6 +1546,20 @@ static void rtp_video_on_readable(void)
     s_v_rx++;
     s_v_last_ts = ts;
     s_v_ssrc    = sr;          /* 每次刷新：对端重启换 SSRC 也跟得上 */
+
+    /* 对称 RTP（RFC 4961）—— 视频也要做，而且**必须**做：
+       视频只收不发，平时没有任何包从这边出去，回程只有 RTCP（PLI/NACK）。
+       不校正的话它们永远发往 SDP 里写的地址 —— 实测 NACK 全发给了信令对端
+       （app nack=8，代理 nacks=0），"重传闭环"是个假闭环。 */
+    {
+        uint16_t p = ntohs(from.sin_port);
+        if (s_call.rtp_remote_v != p) {
+            s_call.rtp_remote_v = p;
+            printf("[rtp] video peer learned port %u (symmetric rtp)\n", p);
+            fflush(stdout);
+        }
+    }
+
     app_video_on_rtp(payload, plen, ts, sq);
 }
 
@@ -1596,6 +1652,7 @@ static void *recv_loop(void *arg)
         int sel = select((int)maxfd + 1, &rfds, NULL, NULL, &tv);
         if (sel <= 0) {
             rtp_tx_tick();
+            app_video_tick();   /* 洞超时放行 / NACK 重发：没有包也要推时钟 */
             /* CANCEL 发出后 5s 还没等到 487：清对话兜底，避免一直占线 */
             if (s_call.cancelled && (now_ms() - s_call.t_cancel_ms) > 5000) {
                 printf("[sip] CANCEL 未收到 487，强制清理\n");
@@ -1640,6 +1697,7 @@ static void *recv_loop(void *arg)
 
         /* 有包也要看看是不是该发音频了（20ms 节奏不能只靠超时分支） */
         rtp_tx_tick();
+        app_video_tick();
 
         if (s_rtp != SOCK_INVALID && FD_ISSET(s_rtp, &rfds)) rtp_on_readable();
         if (s_rtp_v != SOCK_INVALID && FD_ISSET(s_rtp_v, &rfds)) rtp_video_on_readable();
