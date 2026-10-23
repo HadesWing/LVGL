@@ -25,6 +25,12 @@ set -e
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SELF_DIR"
 
+# 本机自证版本要能跑起来：Windows 下 exe 依赖 MSYS2 的运行库（libgcc/stdc++/SDL2），
+# 缺 DLL 时进程直接起不来，会被误判成"这是交叉编译产物"。
+if [ -d /c/msys64/mingw64/bin ]; then
+    export PATH="/c/msys64/mingw64/bin:$PATH"
+fi
+
 ALLOW_DIRTY=0
 RUN_TESTS=1
 for a in "$@"; do
@@ -144,7 +150,12 @@ VER_LINE="$("dist/$PKG/bin/indoor-unit${EXE_SUFFIX}" --version 2>/dev/null || tr
 if [ -n "$VER_LINE" ]; then
     echo "   版本自证：$VER_LINE"
 else
-    echo "   （版本自证跳过：交叉编译产物在本机跑不起来，这是正常的）"
+    if [ -n "${TOOLCHAIN:-}" ]; then
+        echo "   （版本自证跳过：交叉编译产物在本机跑不起来，这是正常的）"
+    else
+        echo "   ⚠ 版本自证失败：本平台构建却跑不起来 —— 多半是缺运行库，"
+        echo "     这会让「装到板子上才发现跑不了」的坑提前到打包时暴露，值得查一下"
+    fi
 fi
 
 # 包内自校验：解开之后能自己验完整性，不用回头找 .sha256
