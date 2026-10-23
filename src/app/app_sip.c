@@ -216,6 +216,10 @@ static void set_state(sip_state_t st)
 sip_state_t app_sip_state(void) { return s_state; }
 const char *app_sip_peer_name(void) { return s_call.peer; }
 
+bool app_sip_registered(void) { return s_registered; }
+
+bool app_sip_video_negotiated(void) { return s_call.video_on; }
+
 int app_sip_call_seconds(void)
 {
     if (s_state != SIP_INCALL || !s_call.t_answer_ms) return 0;

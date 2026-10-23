@@ -21,13 +21,11 @@
 #include "ui_nav.h"
 #include "ui_category.h"
 #include "ui_device.h"
+#include "ui_dial.h"
 #include "ui_theme.h"
 #include "app_devices.h"
 #include "app_events.h"
 #include "oem.h"
-#ifdef APP_WITH_SIP
-#include "app_sip.h"
-#endif
 #include "lvgl.h"
 
 #include <stdio.h>
@@ -64,14 +62,11 @@ static void on_sip_state(const app_event_t *e, void *user)
     lv_label_set_text(s_sip_lbl, oem_text(t));
 }
 
-/* 点状态栏的 SIP 文字 = 呼叫门口机（对端号码由环境变量 SIP_PEER 指定，默认 1002） */
+/* 点状态栏的 SIP 文字 = 打开拨号页（输入房号呼出 / 房号@IP 直呼） */
 static void sip_lbl_click_cb(lv_event_t *e)
 {
     (void)e;
-#ifdef APP_WITH_SIP
-    const char *peer = getenv("SIP_PEER");
-    app_sip_call((peer && *peer) ? peer : "1002");
-#endif
+    ui_dial_open();
 }
 
 /*---------------------------------------------------------------------------

@@ -107,6 +107,7 @@ set(MAIN_SOURCES src/mouse_cursor_icon.c
                  src/ui/ui_category.c
                  src/ui/ui_device.c
                  src/ui/ui_call.c
+                 src/ui/ui_dial.c
                  src/app/app_events.c
                  src/app/app_devices.c
                  src/app/app_stats.c

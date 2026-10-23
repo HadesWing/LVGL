@@ -52,4 +52,10 @@ const char *app_sip_peer_name(void);     /* 对端显示名/号码 */
 int         app_sip_call_seconds(void);  /* 通话时长（秒） */
 void        app_sip_rtp_stats(uint32_t *rx, uint32_t *tx);  /* RTP 收发包数 */
 
+/* 已注册到服务器？（决定拨号页"纯房号"能不能拨 —— 房号要靠服务器路由） */
+bool        app_sip_registered(void);
+/* 本通电话的 SDP 是否协商出了视频。false = 纯语音（UI 不该显示"等待画面"）。
+   接通前是 false —— 那时候 answer 还没到，视频与否未知。 */
+bool        app_sip_video_negotiated(void);
+
 #endif /* APP_SIP_H */

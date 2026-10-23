@@ -32,7 +32,9 @@
 static lv_obj_t *s_scr;          /* 呼叫页（NULL = 未显示） */
 static lv_obj_t *s_view;         /* 视频窗口容器（圆角裁剪） */
 static lv_obj_t *s_ph;           /* 占位图标：还没收到画面时显示 */
+static lv_obj_t *s_ph_txt;       /* 占位文字（"等待画面"/"对端未推视频"） */
 static lv_obj_t *s_img;          /* 视频画面（收到第一帧后显示） */
+static lv_obj_t *s_novideo;      /* SDP 未协商视频时的"纯语音通话"提示 */
 static lv_obj_t *s_name_lbl;
 static lv_obj_t *s_hint_lbl;
 static lv_obj_t *s_timer_lbl;
@@ -72,6 +74,43 @@ static int call_seconds(void)
 #else
     return 0;
 #endif
+}
+
+/* 本通电话的 SDP 里到底有没有视频 m-line。
+   没有 → 视频窗口整个收起来，换"纯语音通话"提示，不干等。 */
+static bool video_negotiated(void)
+{
+#ifdef APP_WITH_SIP
+    return app_sip_video_negotiated();
+#else
+    return false;
+#endif
+}
+
+/* 视频区三态：
+ *   A. SDP 未协商视频 → 隐藏视频窗口，显示"纯语音通话"
+ *   B. 协商了视频但通话 3 秒还零帧 → "对端未推视频"（双方 recvonly 的典型场景）
+ *   C. 有帧 → 正常画面（on_video_frame 接管） */
+static void video_area_update(void)
+{
+    if (!s_view || !s_novideo) return;
+
+    if (!video_negotiated()) {                 /* 态 A */
+        lv_obj_set_hidden(s_view, true);
+        lv_obj_set_hidden(s_novideo, false);
+        return;
+    }
+
+    lv_obj_set_hidden(s_novideo, true);
+    lv_obj_set_hidden(s_view, false);
+
+    uint32_t vf = app_video_disp_frames();
+    if (vf == 0 && call_seconds() >= 3) {      /* 态 B */
+        if (s_ph) lv_obj_set_hidden(s_ph, false);
+        if (s_img) lv_obj_set_hidden(s_img, true);
+        if (s_ph_txt) lv_label_set_text(s_ph_txt, "对端未推视频");
+    }
+    /* 态 C 不用管：on_video_frame 已把 ph 藏掉、img 显示 */
 }
 
 static void rtp_stats(uint32_t *rx, uint32_t *tx)
@@ -195,6 +234,8 @@ static void on_video_frame(const app_event_t *e, void *user)
     lv_obj_center(s_img);
     lv_obj_set_hidden(s_img, false);
     if (s_ph) lv_obj_set_hidden(s_ph, true);
+    if (s_novideo) lv_obj_set_hidden(s_novideo, true);
+    if (s_view) lv_obj_set_hidden(s_view, false);
 
     s_last_frame_no = (uint32_t)e->arg1;
 
@@ -224,6 +265,8 @@ static void tick_cb(lv_timer_t *t)
     else
         snprintf(s, sizeof(s), "RTP 收 %u / 发 %u", (unsigned)rx, (unsigned)tx);
     lv_label_set_text(s_stat_lbl, s);
+
+    video_area_update();
 }
 
 static void on_page_delete(lv_event_t *e)
@@ -234,6 +277,8 @@ static void on_page_delete(lv_event_t *e)
     s_img = NULL;
     s_view = NULL;
     s_ph  = NULL;
+    s_ph_txt = NULL;
+    s_novideo = NULL;
     s_scr = NULL;
     s_name_lbl = s_hint_lbl = s_timer_lbl = s_stat_lbl = NULL;
     s_btn_answer = NULL;
@@ -307,12 +352,40 @@ static void build_video_view(lv_obj_t *scr)
     lv_label_set_text(t, "等待画面");
     lv_obj_set_style_text_font(t, FONT_CJK, 0);
     lv_obj_set_style_text_color(t, lv_color_hex(0x4E6072), 0);
+    s_ph_txt = t;
 
     s_img = lv_image_create(s_view);
     lv_obj_set_hidden(s_img, true);
     /* 控件尺寸 == 图片尺寸，所以居中即可，不需要任何缩放 —— 缩放会走变换路径，
        不仅慢，还会让"抓屏 vs 参考帧"的逐像素比对失去意义。 */
     lv_image_set_inner_align(s_img, LV_IMAGE_ALIGN_CENTER);
+}
+
+/* "纯语音通话"提示块：与视频窗口互斥显示（见 video_area_update 的三态） */
+static void build_novideo_note(lv_obj_t *scr)
+{
+    s_novideo = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_novideo);
+    lv_obj_set_size(s_novideo, VIDEO_W, VIDEO_H);
+    lv_obj_set_style_bg_color(s_novideo, lv_color_hex(0x121C26), 0);
+    lv_obj_set_style_bg_opa(s_novideo, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_novideo, 1, 0);
+    lv_obj_set_style_border_color(s_novideo, lv_color_hex(0x24313D), 0);
+    lv_obj_set_flex_flow(s_novideo, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_novideo, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_novideo, 6, 0);
+
+    lv_obj_t *ic = lv_label_create(s_novideo);
+    lv_label_set_text(ic, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_font(ic, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(ic, lv_color_hex(0x3D4F60), 0);
+
+    lv_obj_t *t = lv_label_create(s_novideo);
+    lv_label_set_text(t, "纯语音通话");
+    lv_obj_set_style_text_font(t, FONT_CJK, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(0x4E6072), 0);
+
+    lv_obj_set_hidden(s_novideo, true);   /* 默认按"有视频"走，tick 会纠正 */
 }
 
 static void build_call_page(lv_obj_t *scr, void *arg)
@@ -331,6 +404,8 @@ static void build_call_page(lv_obj_t *scr, void *arg)
     /* 视频窗口：告诉解码线程目标尺寸，按这个框等比缩放 */
     app_video_set_box(VIDEO_W, VIDEO_H);
     build_video_view(scr);
+    build_novideo_note(scr);
+    video_area_update();     /* 首次按 SDP 决定显示哪块，不等 500ms 的 tick */
 
     s_name_lbl = lv_label_create(scr);
     lv_obj_set_style_text_font(s_name_lbl, FONT_CJK, 0);
@@ -396,6 +471,18 @@ static void on_sip_state(const app_event_t *e, void *user)
         if (!s_scr) return;
         lv_obj_set_hidden(s_btn_answer, true);
         lv_label_set_text(s_hint_lbl, "通话中");
+        if (!s_tick) s_tick = lv_timer_create(tick_cb, 500, NULL);
+        return;
+    }
+
+    if (ui == 4) {                          /* 呼出中：弹页 + 计时，等对端应答 */
+        open_page();
+        if (!s_scr) return;
+        lv_obj_set_hidden(s_btn_answer, true);
+        lv_label_set_text(s_name_lbl, peer_name());
+        lv_label_set_text(s_hint_lbl, "呼叫中…");
+        lv_label_set_text(s_timer_lbl, "");
+        lv_label_set_text(s_stat_lbl, "");
         if (!s_tick) s_tick = lv_timer_create(tick_cb, 500, NULL);
         return;
     }
