@@ -213,7 +213,12 @@
 #define LV_USE_VECTOR_GRAPHIC 0
 
 /** Render a widget and its children into an image buffer with lv_snapshot_take(). */
-#define LV_USE_SNAPSHOT 0
+/* 打开是为了**验收**：视频上屏后把整个屏幕抓成 PPM，和参考帧逐像素比（见
+ * scripts/disp_compare.py）。没有它就只能"看着像"，而花屏/偏色/纵向翻转
+ * 在小屏上都能被误认为"信号不好"。量产的 product 版本可以关掉，
+ * 关掉之后 ui_call.c 里 SIP_VIDEO_DISP_SHOT 那段自然失效（编译报未定义符号，
+ * 所以真要关就一并删掉那段，别留半截）。 */
+#define LV_USE_SNAPSHOT 1
 
 /** Backend that gives the SW renderer vector graphics support. */
 #define LV_USE_THORVG 0

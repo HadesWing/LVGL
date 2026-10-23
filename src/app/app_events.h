@@ -26,6 +26,9 @@ typedef enum {
     EV_VOICE_TEXT,          /* ptr  = ASR 文本(const char*)；语音浮层字幕 */
     EV_VOICE_STATE,         /* arg0 = 语音状态机状态（M2 细化） */
     EV_SIP_STATE,           /* arg0 = 呼叫状态（M3：0=idle 1=incoming 2=answered） */
+    EV_VIDEO_FRAME,         /* arg0 = 视频槽号；arg1 = 解码帧序号（1 基）
+                               帧像素不在事件里，靠 app_video_disp_acquire() 取 ——
+                               一帧 124KB，塞进事件队列等于每帧多拷一次。 */
     EV_TYPE_COUNT
 } app_event_type_t;
 

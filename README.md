@@ -23,7 +23,7 @@
 | `scripts/dev.sh` | 真正的构建/运行/压测脚本（MSYS2 环境、避开中文路径、并发生死锁规避） |
 | `lv_conf.h` | **LVGL 配置总开关**（内存池大小、断言、性能监视器，见"踩坑记录"第 4 条） |
 | `CMakeLists.txt` | 构建脚本（lvgl 作为子模块引入；`-DLV_MEM_SIZE` / `-DLV_DEBUG_ASSERT` / `-DLVGL_HAL`） |
-| `docs/` | 教程 + 部署/移植文档 + **《产品规划_智能家居中控台.md》**（三大功能的架构与里程碑）；**《SIP注册与配置体系.md》**（交付形态 / 配置分层 / 注册状态机）；**《开源组件清单与占比.md》**（依赖清单、许可义务、可裁剪空间）；**《音频通路自测方案.md》**（不用声卡、不用手机，两条通路各自验收；第 9 节为双端互通 `make duo`） |
+| `docs/` | 教程 + 部署/移植文档 + **《产品规划_智能家居中控台.md》**（三大功能的架构与里程碑）；**《SIP注册与配置体系.md》**（交付形态 / 配置分层 / 注册状态机）；**《开源组件清单与占比.md》**（依赖清单、许可义务、可裁剪空间）；**《音频通路自测方案.md》**（不用声卡、不用手机，两条通路各自验收；第 9 节为双端互通 `make duo`）；**《视频接收链路验证.md》**（为什么推流方用 ffmpeg / 两档判据 / 实测 299 帧 bit-exact）；**《视频上屏验证.md》**（YUV→RGB565 缩放、槽位跨线程交接、抓屏逐像素验收）；**《单元测试.md》**（自研零依赖 UT 框架与 84 用例分布） |
 | `config/sip.ini.example` | **现场配置模板**（服务器/账号/端口/续期）；实际 `sip.ini` 不入库 |
 | `scripts/setup_windows_msys2.sh` | 一键环境搭建（Windows + MSYS2 + 国内镜像） |
 | `lvgl/` | 上游 LVGL 库（**git submodule，不纳入本仓库**，首次使用需拉取） |
@@ -85,6 +85,9 @@ make run        # 只运行
 | `make debug` | 打开 LVGL 断言（越界、野指针、样式/对象一致性） | 查 bug |
 | `make longrun` | 30 分钟长稳，到点自动打印汇总并退出 | 长稳 |
 | `make duo` | 本机起两个实例（室内机 + PC 客户端）对打，**双向音频各验一次**（SNR + 丢包 + 落盘） | 双端互通 |
+| `make duo-video` | **ffmpeg 推 RTP** → 室内机解包/解码/落盘 → 与参考 YUV **逐字节比对** | 视频解码正确性 |
+| `make duo-disp` | 解码 → **RGB565 缩放 → LVGL 绘制** → 抓屏 → 与参考帧**逐像素比对** | 视频上屏正确性 |
+| `make ut` | 自研代码单元测试（84 个用例，零依赖，PC 与板子同一份） | 回归 |
 | `make rebuild` / `make clean` | 全量重编 / 删构建目录 | |
 
 两个环境变量随时可用（Windows 的 cmd 里用 `set LVGL_RUN_SEC=60` 后再跑）：
@@ -341,7 +344,7 @@ python scripts/audio_compare.py test_8k.wav rx.wav     # → SNR 43.1 dB
 - [x] **产品规划**：智能家居中控台三大功能拆解（`docs/产品规划_智能家居中控台.md`）
 - [x] **M1**：中控台骨架 —— flex/grid 主页 + **三级信息架构**（分类宫格 → 房间页签 → 设备详情）+ 设备模型 + 事件总线 + ini 持久化
 - [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析（**当前用 app_mock 模拟 ASR 事件**）
-- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**；另有板端自测工具 `tools/sip_echo`（纯 C 应答器，陪产品一起上板）；音频收发两条通路已用 file↔file 方式独立验收（SNR 43.1 dB、丢包 0），并用 **`make duo` 双进程对打**做了真双向验证（室内机→客户端 / 客户端→室内机，各 12s：tx/rx 600↔600、loss 0.00%、SNR 43.1 dB）。见 `docs/SIP联调环境.md`、`docs/音频通路自测方案.md`（第 9 节）
+- [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**；另有板端自测工具 `tools/sip_echo`（纯 C 应答器，陪产品一起上板）；音频收发两条通路已用 file↔file 方式独立验收（SNR 43.1 dB、丢包 0），并用 **`make duo` 双进程对打**做了真双向验证（室内机→客户端 / 客户端→室内机，各 12s：tx/rx 600↔600、loss 0.00%、SNR 43.1 dB）。**视频接收全链路已通**：`h264_depack`（单NAL/STAP-A/FU-A，按 RTP 时间戳切 AU）→ `vdec`（PC 用 libavcodec，板子换 MPP）→ `app_video`；`make duo-video` 实测 **299/299 帧逐字节 bit-exact**（`fu_broken=0`、`dec err=0`）。**上屏也已打通**：`yuv2rgb` 缩放到 288×216 转 RGB565，3 槽位跨线程交接（丢旧留新），`make duo-disp` 抓屏与参考帧 **62208/62208 逐像素相同**。见 `docs/SIP联调环境.md`、`docs/音频通路自测方案.md`（第 9 节）、`docs/视频接收链路验证.md`、`docs/视频上屏验证.md`
 - [x] **M4（部分）**：中文按需子集字库（`scripts/gen_font.py` → `src/ui/fonts/`，212 汉字 × 16/24px），**修掉了"灯/调/风/插/线"显示成方框的问题**
 - [x] **OEM 定制层**（超出原计划）：`src/oem/` 一套接口 + 两套 profile，运行期 `OEM_PROFILE=alt` 热切换宫格/列表两套首页，见 `docs/OEM定制指南.md`
 - [ ] **M5**：全功能量化压测（每个里程碑过一遍 stress，出 stats.csv 曲线）
@@ -353,7 +356,8 @@ python scripts/audio_compare.py test_8k.wav rx.wav     # → SNR 43.1 dB
   `main.exe` **2.79 MB → 1.82 MB（-35%）**，通话与注册回归通过。
   见 `docs/开源组件清单与占比.md`
 - [ ] **M6（等板子）**：`hal_fbdev.c`/`hal_audio.c`（ALSA）+ 交叉编译 + 思必驰/eXosip 实装
-- [ ] **M3 剩余**：视频（H.264 解码 + `lv_image` 显示）—— 室内机"可视"对讲的最后一块
+- [ ] **M3 剩余**：视频**发送方向**（板子推摄像头画面：V4L2 → MPP 编码 → RTP，等 M6）；
+      丢包后"等下一个 IDR 再上屏"（`vdec_flush()` 已有，策略未接）；画面掉帧时的界面提示
   - 测试方案已定：**手机装 Linphone 点对点直呼板子**，不架服务器，手机冒充门外机发声视频，
     板子 `recvonly` 只收不看。分 P0 语音 / P1 `ffplay` 验流 / P2 解码上屏三段。
     见 [`docs/音视频对讲测试方案.md`](docs/音视频对讲测试方案.md)

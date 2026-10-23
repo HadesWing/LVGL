@@ -247,7 +247,7 @@ endif()
 #                                      "只收包不解码"，纯语音通话完全不受影响）
 #   板子 RK3308 接 MPP 硬解时，加一个 vdec_mpp.c 在这里登记即可，上层不动。
 # ---------------------------------------------------------------------------
-list(APPEND MAIN_SOURCES src/media/h264_depack.c src/app/app_video.c)
+list(APPEND MAIN_SOURCES src/media/h264_depack.c src/media/yuv2rgb.c src/app/app_video.c)
 
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)

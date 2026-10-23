@@ -43,5 +43,9 @@ bin/*.h264
 # 双端测试/自测日志（每次跑都会重生成，只在排查时看）
 bin/*.log
 
+# 自测产出的抓屏（PPM/PNG 都是每次跑重新生成的，要留档的复制到 docs/img/）
+bin/*.ppm
+bin/*.png
+
 # WorkBuddy 本地数据（工作记忆、自动化配置）
 .workbuddy/

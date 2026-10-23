@@ -3,16 +3,11 @@
  * @brief 事件总线实现：订阅表 + 环形队列 + 主线程分发
  */
 #include "app_events.h"
+#include "app_lock.h"
 #include "lvgl.h"
 
 #include <stdio.h>
 #include <string.h>
-
-#ifdef _WIN32
-  #include <windows.h>
-#else
-  #include <pthread.h>
-#endif
 
 /*---------------------------------------------------------------------------
  * 订阅表
@@ -41,18 +36,11 @@ typedef struct {
 
 static event_queue_t s_queue;
 
-/* 平台锁 */
-#ifdef _WIN32
-static CRITICAL_SECTION s_lock;
-static void lock_init(void)    { InitializeCriticalSection(&s_lock); }
-static void lock_take(void)    { EnterCriticalSection(&s_lock); }
-static void lock_give(void)    { LeaveCriticalSection(&s_lock); }
-#else
-static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
-static void lock_init(void)    { pthread_mutex_init(&s_lock, NULL); }
-static void lock_take(void)    { pthread_mutex_lock(&s_lock); }
-static void lock_give(void)    { pthread_mutex_unlock(&s_lock); }
-#endif
+/* 平台锁（见 app_lock.h：Win32 = CRITICAL_SECTION，其他 = pthread_mutex） */
+static app_lock_t s_lock;
+static void lock_init(void)    { app_lock_init(&s_lock); }
+static void lock_take(void)    { app_lock_take(&s_lock); }
+static void lock_give(void)    { app_lock_give(&s_lock); }
 
 /*---------------------------------------------------------------------------
  * 主线程分发：30ms 一次，把队列里的事件按序派给订阅者

@@ -170,13 +170,15 @@ make longrun      30 分钟长稳，到点打印汇总并退出
 make echo         板端自测：内置 SIP 回声应答器（纯 C，无需 Python/PC）
 make duo          双端互通：本机两个实例对打，双向音频各验一次
 make duo-video    视频接收链路：ffmpeg 推 RTP → 解包/解码/落盘 → 比对参考 YUV
-make ut           自研代码单元测试（62 个用例，零依赖）
+make duo-disp     视频上屏链路：解码 → RGB565 缩放 → LVGL 绘制 → 抓屏逐像素比对
+make ut           自研代码单元测试（84 个用例，零依赖）
 make rebuild      全量重编（= clean + build）
 make clean        删除所有构建目录
 
 带参数的 PC 工具（走 bash 直接调）：
   bash scripts/duo_test.sh [秒]               双端互通：本机两个实例（室内机+客户端）双向音频各验一次
   bash scripts/duo_video_test.sh [秒]         视频接收链路：ffmpeg 推 RTP → 解包/解码/落盘 → 比对参考 YUV
+  bash scripts/duo_disp_test.sh [秒] [抓屏帧] 视频上屏链路：解码 → RGB565 → LVGL → 抓屏逐像素比
   bash scripts/dev.sh ut [过滤]               自研代码单元测试（零依赖；ut g711 只跑某组）
   bash scripts/dev.sh echo                     起 SIP 回声应答器
   bash scripts/dev.sh probe <file.h264>        离线 H.264 解码探针：打印单帧耗时
