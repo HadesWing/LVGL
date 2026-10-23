@@ -71,8 +71,8 @@ grab_port() {
     grep -o "$2.*listening on udp/[0-9]*" "$1" 2>/dev/null | head -1 | grep -o '[0-9]*$'
 }
 
-B_LOCAL=5062
-A_LOCAL=7062
+B_LOCAL=5072
+A_LOCAL=7072
 
 echo "═══ 视频上屏链路测试（推流 ${DUR}s，第 ${SHOT_AT} 帧抓屏）═══"
 rm -f duo_d_b.log duo_d_a.log "$SHOT" duo_d_b_video.yuv

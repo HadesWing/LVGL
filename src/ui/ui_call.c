@@ -41,6 +41,7 @@ static lv_obj_t *s_timer_lbl;
 static lv_obj_t *s_stat_lbl;
 static lv_obj_t *s_btn_answer;
 static lv_timer_t *s_tick;
+static uint32_t  s_ring_start;   /* 呼出开始时刻（lv_tick），响铃期计时用 */
 
 /* lv_image 只存指针不拷贝，所以描述符必须常驻；内容每帧改写即可。
    （LVGL 的图片缓存已关：LV_CACHE_DEF_SIZE=0，不会因为指针没变而返回旧图） */
@@ -252,9 +253,25 @@ static void tick_cb(lv_timer_t *t)
 {
     if (!s_scr) { lv_timer_delete(t); s_tick = NULL; return; }
 
+    /* 计时：接通后走通话时长；还没接通但已呼出/被呼，走响铃时长（灰色提示）。
+       通话开始的一瞬 call_seconds() 从 0 变正，计时标签自动无缝衔接。 */
+    int sec = call_seconds();
     char b[32];
-    fmt_time(b, sizeof(b), call_seconds());
-    lv_label_set_text(s_timer_lbl, b);
+    if (sec > 0) {
+        fmt_time(b, sizeof(b), sec);
+        lv_obj_set_style_text_color(s_timer_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(s_timer_lbl, b);
+        lv_label_set_text(s_hint_lbl, "通话中");
+    } else if (s_ring_start) {
+        int rs = (int)((lv_tick_get() - s_ring_start) / 1000u);
+        fmt_time(b, sizeof(b), rs);
+        lv_obj_set_style_text_color(s_timer_lbl, lv_color_hex(0x6E7B8A), 0);
+        lv_label_set_text(s_timer_lbl, b);
+        /* 接听键还在 = 对方打来的正在响；被藏了 = 我方呼出的等应答 */
+        lv_label_set_text(s_hint_lbl,
+            (s_btn_answer && !lv_obj_has_flag(s_btn_answer, LV_OBJ_FLAG_HIDDEN))
+                ? "来电响铃…" : "呼叫中…");
+    }
 
     uint32_t rx = 0, tx = 0;
     rtp_stats(&rx, &tx);
@@ -265,6 +282,14 @@ static void tick_cb(lv_timer_t *t)
     else
         snprintf(s, sizeof(s), "RTP 收 %u / 发 %u", (unsigned)rx, (unsigned)tx);
     lv_label_set_text(s_stat_lbl, s);
+
+    /* 纯语音通话的抓屏入口：没有视频帧就永远走不到 on_video_frame 里的
+       抓屏触发，这里按"接通后第 SHOT_AT 秒"补一个触发点（默认 3s）。 */
+    if (s_shot_path[0] && !s_shot_done && !s_shot_timer &&
+        !video_negotiated() && sec >= (s_shot_at > 0 ? s_shot_at : 3)) {
+        s_shot_done = true;
+        s_shot_timer = lv_timer_create(shot_timer_cb, 80, NULL);
+    }
 
     video_area_update();
 }
@@ -282,6 +307,7 @@ static void on_page_delete(lv_event_t *e)
     s_scr = NULL;
     s_name_lbl = s_hint_lbl = s_timer_lbl = s_stat_lbl = NULL;
     s_btn_answer = NULL;
+    s_ring_start = 0;
     if (s_tick) { lv_timer_delete(s_tick); s_tick = NULL; }
     if (s_shot_timer) { lv_timer_delete(s_shot_timer); s_shot_timer = NULL; }
 }
@@ -294,14 +320,14 @@ static lv_obj_t *make_round_btn(lv_obj_t *parent, const char *sym, const char *t
 {
     lv_obj_t *btn = lv_obj_create(parent);
     lv_obj_remove_style_all(btn);
-    lv_obj_set_size(btn, 84, 84);
+    lv_obj_set_size(btn, 72, 72);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_add_style(btn, style, 0);
     lv_obj_add_style(btn, &st_btn_pressed, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(btn, 4, 0);
+    lv_obj_set_style_pad_all(btn, 2, 0);
 
     lv_obj_t *icon = lv_label_create(btn);
     lv_label_set_text(icon, sym);
@@ -398,8 +424,11 @@ static void build_call_page(lv_obj_t *scr, void *arg)
 
     lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(scr, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(scr, 12, 0);
-    lv_obj_set_style_pad_row(scr, 8, 0);
+    /* 布局预算（320x480）：视频 216 + 文案约 116 + 按钮 72 + 间距 ≈ 430，
+       必须留出底部按钮的完整 72px —— 以前 84px 按钮配 32px 大计时，
+       总高超了屏幕，挂断按钮被挤出屏外（看起来就像"没有挂断按钮"）。 */
+    lv_obj_set_style_pad_all(scr, 10, 0);
+    lv_obj_set_style_pad_row(scr, 5, 0);
 
     /* 视频窗口：告诉解码线程目标尺寸，按这个框等比缩放 */
     app_video_set_box(VIDEO_W, VIDEO_H);
@@ -418,7 +447,7 @@ static void build_call_page(lv_obj_t *scr, void *arg)
     lv_label_set_text(s_hint_lbl, "来电呼叫");
 
     s_timer_lbl = lv_label_create(scr);
-    lv_obj_set_style_text_font(s_timer_lbl, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_font(s_timer_lbl, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(s_timer_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_label_set_text(s_timer_lbl, "");
 
@@ -432,8 +461,7 @@ static void build_call_page(lv_obj_t *scr, void *arg)
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(row, 28, 0);
-    lv_obj_set_style_pad_top(row, 6, 0);
+    lv_obj_set_style_pad_column(row, 32, 0);
 
     s_btn_answer = make_round_btn(row, LV_SYMBOL_CALL, "接听", &st_btn_ok, on_answer);
     make_round_btn(row, LV_SYMBOL_CLOSE, "挂断", &st_btn_danger, on_hangup);
@@ -458,6 +486,7 @@ static void on_sip_state(const app_event_t *e, void *user)
     if (ui == 2) {                          /* 来电：弹页面 */
         open_page();
         if (!s_scr) return;
+        if (!s_ring_start) s_ring_start = lv_tick_get();
         lv_label_set_text(s_name_lbl, peer_name());
         lv_label_set_text(s_hint_lbl, "来电呼叫");
         lv_label_set_text(s_timer_lbl, "");
@@ -471,6 +500,7 @@ static void on_sip_state(const app_event_t *e, void *user)
         if (!s_scr) return;
         lv_obj_set_hidden(s_btn_answer, true);
         lv_label_set_text(s_hint_lbl, "通话中");
+        s_ring_start = 0;                   /* 接通：计时交给 call_seconds */
         if (!s_tick) s_tick = lv_timer_create(tick_cb, 500, NULL);
         return;
     }
@@ -481,13 +511,14 @@ static void on_sip_state(const app_event_t *e, void *user)
         lv_obj_set_hidden(s_btn_answer, true);
         lv_label_set_text(s_name_lbl, peer_name());
         lv_label_set_text(s_hint_lbl, "呼叫中…");
-        lv_label_set_text(s_timer_lbl, "");
         lv_label_set_text(s_stat_lbl, "");
+        if (!s_ring_start) s_ring_start = lv_tick_get();
         if (!s_tick) s_tick = lv_timer_create(tick_cb, 500, NULL);
         return;
     }
 
     /* 其余状态（含挂断后回到 online）：收页面 */
+    s_ring_start = 0;
     if (s_scr) {
         s_scr = NULL;                       /* 先置空，避免 pop 触发 DELETE 时重入 */
         ui_nav_pop();
