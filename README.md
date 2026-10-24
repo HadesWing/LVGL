@@ -103,6 +103,7 @@ make run        # 只运行
 | `make ut` | 自研代码单元测试（120 个用例，零依赖，PC 与板子同一份） | 回归 |
 | `make loss` | **注入丢包** → 逐帧 CRC 核对（开恢复必须 0 脏帧，关恢复必须 >0） | 丢包恢复（慢路径） |
 | `make loss-nack` | 在 loss 之上加第三遍：**NACK 重传闭环**（代理扮演支持 RTX 的门口机，期望重传全补上、resync 零惊动） | 丢包重传 |
+| `make stress-call ROUND=20 HOLD=5` | **N 轮呼叫循环压测**：被测实例常驻不重启，判内存斜率（目标 ≈0 B/s）、碎片率、每轮音频峰值、视频零脏帧 | 长稳 / 泄漏 |
 | `make release` | 发布打包：UT → 发布构建（strip）→ `dist/*.tar.gz` + sha256 | 出货 |
 | `make rebuild` / `make clean` | 全量重编 / 删构建目录 | |
 

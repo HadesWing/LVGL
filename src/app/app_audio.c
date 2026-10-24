@@ -602,8 +602,12 @@ bool app_audio_is_open(void) { return s_open; }
 
 void app_audio_call_end(void)
 {
-    /* 落盘模式：一次通话一个 wav，在这里收尾；下次 write 会自动开新文件 */
+    /* 落盘模式：一次通话一个 wav，在这里收尾；下次 write 会自动开新文件。
+       收尾后把本轮统计清零 —— 压测判据靠"每轮峰值>0"确认音频真的有数据，
+       跨轮累计会把坏轮藏进历史峰值里。 */
     if (s_sink_fp) sink_wav_close();
+    s_rx_samples = 0;
+    s_rx_peak    = 0;
     app_audio_tone_stop();
     s_tone2.warned = false;   /* 新通话重新给一次"没喇叭"的提示机会 */
 }
