@@ -203,7 +203,19 @@ static unsigned proc_id(void)
 
 static void set_state(sip_state_t st)
 {
+    sip_state_t old = s_state;
     s_state = st;
+
+    /* 提示音跟状态走（M2）：响铃就振、接通就停、挂断回 idle 补一声忙音。
+       只在音频子系统可用时出声（内部自己判断），UI/其它模块零改动。 */
+    if (st == SIP_INCOMING || st == SIP_RINGING)
+        app_audio_tone_start(AUDIO_TONE_RINGBACK);
+    else if (st == SIP_INCALL)
+        app_audio_tone_stop();               /* 接通：振铃立刻停 */
+    else if ((st == SIP_ONLINE || st == SIP_ERROR || st == SIP_IDLE) &&
+             (old == SIP_INCALL || old == SIP_INCOMING || old == SIP_RINGING))
+        app_audio_tone_start(AUDIO_TONE_BUSY);   /* 从通话态掉下来：忙音 2s 自停 */
+
     /* UI 事件值：0=idle 1=online 2=来电 3=通话中 4=呼出中 */
     int ui = (st == SIP_ONLINE)      ? 1
            : (st == SIP_INCOMING)    ? 2
@@ -476,7 +488,9 @@ static void rtp_stop_media(void)
     app_video_set_nack_cb(NULL);
     app_video_stats_print("hangup");
     app_video_close();
-    app_audio_close();
+    /* 通话粒度收尾，不关设备：喇叭/麦克风常驻（真实室内机语义），
+       挂断后 set_state 还要播忙音 —— 以前在这里 close，忙音永远无声 */
+    app_audio_call_end();
     s_rtp_echo = false;
 }
 
@@ -1279,6 +1293,20 @@ static void handle_request(osip_message_t *msg, struct sockaddr_in *from)
         else
             safe_str(s_call.peer, sizeof(s_call.peer), "unknown");
 
+        /* BYE 的目标 URI：接听方也必须填。以前只有主叫（app_sip_call）填它，
+           被叫挂断时 BYE 请求行是 "BYE  SIP/2.0"（URI 空），对端 parse failed
+           永远收不到挂断 —— 实测发现的既有 bug。 */
+        if (msg->from && msg->from->url && msg->from->url->host) {
+            const char *u = (msg->from->url->username && *msg->from->url->username)
+                            ? msg->from->url->username : "unknown";
+            if (msg->from->url->port && *msg->from->url->port)
+                snprintf(s_call.peer_uri, sizeof(s_call.peer_uri),
+                         "sip:%s@%s:%s", u, msg->from->url->host, msg->from->url->port);
+            else
+                snprintf(s_call.peer_uri, sizeof(s_call.peer_uri),
+                         "sip:%s@%s", u, msg->from->url->host);
+        }
+
         osip_body_t *body = NULL;
         if (osip_message_get_body(msg, 0, &body) == 0 && body && body->body)
             parse_remote_sdp(body->body, &s_call.rtp_remote,
@@ -1670,9 +1698,31 @@ static void *recv_loop(void *arg)
         struct timeval tv = (s_state == SIP_INCALL) ? (struct timeval){ 0, 20000 }
                                                     : (struct timeval){ 0, 100000 };
         int sel = select((int)maxfd + 1, &rfds, NULL, NULL, &tv);
+
+        /* 时钟类任务：两个分支都要跑 —— 有包时 select 立刻返回，
+           20ms 的发送节奏、洞超时、提示音不能只靠超时分支推。 */
+        rtp_tx_tick();
+        app_video_tick();        /* 洞超时放行 / NACK 重发：没有包也要推时钟 */
+        app_audio_tone_tick();   /* 提示音按时钟出 PCM，不能只靠收包驱动 */
+
+        /* 自测用：SIP_AUTOHANGUP=<秒> 呼出/通话 N 秒后自动挂断。
+           放公共路径：原来只在超时分支检查，通话中包流不断就永远轮不到。 */
+        {
+            static int hang_s = -1;
+            if (hang_s < 0) {
+                const char *v = getenv("SIP_AUTOHANGUP");
+                hang_s = (v && *v) ? atoi(v) : 0;
+            }
+            if (hang_s > 0 &&
+                (s_state == SIP_INCALL || s_state == SIP_RINGING)) {
+                int secs = (s_state == SIP_INCALL)
+                         ? app_sip_call_seconds()
+                         : (int)((now_ms() - s_call.t_start_ms) / 1000u);
+                if (secs >= hang_s) app_sip_hangup();
+            }
+        }
+
         if (sel <= 0) {
-            rtp_tx_tick();
-            app_video_tick();   /* 洞超时放行 / NACK 重发：没有包也要推时钟 */
             /* CANCEL 发出后 5s 还没等到 487：清对话兜底，避免一直占线 */
             if (s_call.cancelled && (now_ms() - s_call.t_cancel_ms) > 5000) {
                 printf("[sip] CANCEL 未收到 487，强制清理\n");
@@ -1699,25 +1749,8 @@ static void *recv_loop(void *arg)
                 s_auth_tried = 0;
                 send_register();
             }
-            /* 自测用：SIP_AUTOHANGUP=<秒> 通话 N 秒后自动挂断 */
-            static int hang_s = -1;
-            if (hang_s < 0) {
-                const char *v = getenv("SIP_AUTOHANGUP");
-                hang_s = (v && *v) ? atoi(v) : 0;
-            }
-            if (hang_s > 0 &&
-                (s_state == SIP_INCALL || s_state == SIP_RINGING)) {
-                int secs = (s_state == SIP_INCALL)
-                         ? app_sip_call_seconds()
-                         : (int)((now_ms() - s_call.t_start_ms) / 1000u);
-                if (secs >= hang_s) app_sip_hangup();
-            }
             continue;
         }
-
-        /* 有包也要看看是不是该发音频了（20ms 节奏不能只靠超时分支） */
-        rtp_tx_tick();
-        app_video_tick();
 
         if (s_rtp != SOCK_INVALID && FD_ISSET(s_rtp, &rfds)) rtp_on_readable();
         if (s_rtp_v != SOCK_INVALID && FD_ISSET(s_rtp_v, &rfds)) rtp_video_on_readable();

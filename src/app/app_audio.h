@@ -57,6 +57,12 @@ bool app_audio_open(void);
 void app_audio_close(void);
 bool app_audio_is_open(void);
 
+/* 通话粒度收尾（rtp_stop_media 时调）：收尾落盘 wav、停提示音。
+   **不关设备** —— 室内机的喇叭/麦克风是常驻的：挂断后还要播忙音，
+   来电马上又要振铃。真正的 close 只在进程退出时发生。
+   （以前这里直接 close，忙音就在设备关掉之后触发，永远无声。） */
+void app_audio_call_end(void);
+
 /* 能不能发上行（音源取得到数据） / 能不能把下行交出去（喇叭或文件） */
 bool app_audio_can_record(void);
 bool app_audio_can_play(void);
@@ -68,6 +74,31 @@ int app_audio_read(int16_t *pcm, int n);
 
 /* 把远端 PCM 交出去：进播放环，或写进 wav（按当前音宿） */
 void app_audio_write(const int16_t *pcm, int n);
+
+/*---------------------------------------------------------------------------
+ * 本地提示音（M2）：与 RTP 上下行无关的"机器自己说话"
+ *
+ * 【设计】450Hz 单频 + 通/断节奏（GB/T 15279 的关键节奏，不做和弦）：
+ *   RINGBACK 振铃/回铃 1s 通 + 4s 断 —— 来电和呼出共用（对讲场景听不出差别）；
+ *   BUSY     忙音 0.35s 通 + 0.35s 断，默认响 2s 自动停 —— 挂断/拒接/呼叫失败。
+ * 数据直接注入播放环：响铃期没有远端音频，不存在叠加冲突。
+ * 只在喇叭路由（sink=spk）真的开着时出声；没声卡静默跳过，不报错。
+ * SIP_NO_TONE 一键全关（CI/无声卡机器）。
+ *---------------------------------------------------------------------------*/
+typedef enum {
+    AUDIO_TONE_RINGBACK = 0,   /* 振铃/回铃：1s 通 4s 断 */
+    AUDIO_TONE_BUSY            /* 忙音：0.35s 通 0.35s 断，2s 自动停 */
+} audio_tone_id_t;
+
+/* 开始播提示音。同 id 重复调用不打断不重置（状态机反复触发是常态）；
+   不同 id 会切换。谁停？RINGBACK 由状态机离开响铃态时 stop，
+   BUSY 自带 2 秒上限，忘了 stop 也不会响一辈子。 */
+void app_audio_tone_start(audio_tone_id_t id);
+void app_audio_tone_stop(void);
+
+/* 推时钟：由 SIP 线程的 recv_loop 每 ≤20ms 调一次，内部按真实时间
+   补齐该出的 PCM（select 超时/有包两条路径都会走到） */
+void app_audio_tone_tick(void);
 
 /* 运行统计：播放欠载（爆音风险）、采集溢出（丢音）次数 */
 void app_audio_stats(uint32_t *underrun, uint32_t *overrun);

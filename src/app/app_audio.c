@@ -65,6 +65,147 @@ static int32_t  s_rx_peak;        /* 下行最大绝对值（判断"是不是全
 static int      s_tone_phase;
 
 /*---------------------------------------------------------------------------
+ * 本地提示音引擎（M2）
+ *
+ * 【为什么是查表 + 相位累加，不是 sin()】
+ *   项目原则是不拉 libm（板子上少一个依赖）。450Hz @ 8k 不是整数周期
+ *   （8000/450 = 17.78），1kHz 那种 8 点小表用不了，所以用 256 点大表 +
+ *   定点相位累加：phase 单位是 1/10 表格项，每采样步进 10*256*freq/RATE，
+ *   450Hz = 288/10。频率误差 < 0.4%（表格分辨率 1.4Hz），提示音够用。
+ *---------------------------------------------------------------------------*/
+#define TONE_AMPL      5000     /* ≈ -10.3dBFS：够醒耳，不炸耳 */
+#define TONE_450_IDX   288      /* phase 增量（1/10 表格项/采样）*/
+
+static const int16_t k_sine256[256] = {
+         0,   804,  1608,  2410,  3212,  4011,  4808,  5602,
+      6393,  7179,  7962,  8739,  9512, 10278, 11039, 11793,
+     12539, 13279, 14010, 14732, 15446, 16151, 16846, 17530,
+     18204, 18868, 19519, 20159, 20787, 21403, 22005, 22594,
+     23170, 23731, 24279, 24811, 25329, 25832, 26319, 26790,
+     27245, 27684, 28106, 28510, 28898, 29268, 29621, 29956,
+     30273, 30571, 30852, 31113, 31356, 31580, 31785, 31971,
+     32137, 32285, 32412, 32521, 32609, 32678, 32728, 32757,
+     32767, 32757, 32728, 32678, 32609, 32521, 32412, 32285,
+     32137, 31971, 31785, 31580, 31356, 31113, 30852, 30571,
+     30273, 29956, 29621, 29268, 28898, 28510, 28106, 27684,
+     27245, 26790, 26319, 25832, 25329, 24811, 24279, 23731,
+     23170, 22594, 22005, 21403, 20787, 20159, 19519, 18868,
+     18204, 17530, 16846, 16151, 15446, 14732, 14010, 13279,
+     12539, 11793, 11039, 10278,  9512,  8739,  7962,  7179,
+      6393,  5602,  4808,  4011,  3212,  2410,  1608,   804,
+         0,  -804, -1608, -2410, -3212, -4011, -4808, -5602,
+     -6393, -7179, -7962, -8739, -9512,-10278,-11039,-11793,
+    -12539,-13279,-14010,-14732,-15446,-16151,-16846,-17530,
+    -18204,-18868,-19519,-20159,-20787,-21403,-22005,-22594,
+    -23170,-23731,-24279,-24811,-25329,-25832,-26319,-26790,
+    -27245,-27684,-28106,-28510,-28898,-29268,-29621,-29956,
+    -30273,-30571,-30852,-31113,-31356,-31580,-31785,-31971,
+    -32137,-32285,-32412,-32521,-32609,-32678,-32728,-32757,
+    -32767,-32757,-32728,-32678,-32609,-32521,-32412,-32285,
+    -32137,-31971,-31785,-31580,-31356,-31113,-30852,-30571,
+    -30273,-29956,-29621,-29268,-28898,-28510,-28106,-27684,
+    -27245,-26790,-26319,-25832,-25329,-24811,-24279,-23731,
+    -23170,-22594,-22005,-21403,-20787,-20159,-19519,-18868,
+    -18204,-17530,-16846,-16151,-15446,-14732,-14010,-13279,
+    -12539,-11793,-11039,-10278, -9512, -8739, -7962, -7179,
+     -6393, -5602, -4808, -4011, -3212, -2410, -1608,  -804,
+};
+
+static struct {
+    bool            active;
+    audio_tone_id_t id;
+    uint32_t        start_ms;   /* 本次 start 的时刻（SDL_GetTicks） */
+    uint32_t        on_ms, off_ms, max_ms;
+    uint32_t        phase;      /* 1/10 表格项 */
+    bool            warned;     /* 没喇叭只警告一次 */
+} s_tone2;
+
+static void ring_push(ring_t *r, const int16_t *src, int n);   /* 定义在环操作一节 */
+
+static void tone_pattern(audio_tone_id_t id, uint32_t *on, uint32_t *off, uint32_t *max)
+{
+    if (id == AUDIO_TONE_RINGBACK) { *on = 1000; *off = 4000; *max = 0; }
+    else                           { *on = 350;  *off = 350;  *max = 2000; }
+}
+
+static bool tone_enabled(void)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("SIP_NO_TONE") ? 0 : 1;
+    return en == 1;
+}
+
+void app_audio_tone_start(audio_tone_id_t id)
+{
+    if (!tone_enabled()) return;
+    if (s_tone2.active && s_tone2.id == id) return;   /* 幂等：状态机反复触发别打断 */
+
+    tone_pattern(id, &s_tone2.on_ms, &s_tone2.off_ms, &s_tone2.max_ms);
+    s_tone2.id       = id;
+    s_tone2.start_ms = SDL_GetTicks();
+    s_tone2.phase    = 0;
+    s_tone2.active   = true;
+
+    if (!s_open || s_sink != AUDIO_SINK_SPK || !s_play_ok) {
+        if (!s_tone2.warned) {
+            s_tone2.warned = true;
+            printf("[audio] 提示音静默：喇叭路由没开，只记账不出声\n");
+        }
+    } else {
+        printf("[audio] tone %s 开始\n", id == AUDIO_TONE_RINGBACK ? "振铃/回铃" : "忙音");
+        fflush(stdout);
+    }
+}
+
+void app_audio_tone_stop(void)
+{
+    if (s_tone2.active) {
+        printf("[audio] tone 停止（响了 %u ms）\n",
+               (unsigned)(SDL_GetTicks() - s_tone2.start_ms));
+        fflush(stdout);
+    }
+    s_tone2.active = false;
+}
+
+void app_audio_tone_tick(void)
+{
+    if (!s_tone2.active) return;
+
+    uint32_t now = SDL_GetTicks();
+    if (s_tone2.max_ms && now - s_tone2.start_ms >= s_tone2.max_ms) {
+        app_audio_tone_stop();
+        return;
+    }
+    /* 没喇叭就只推进时钟（max_ms 到点自动停的逻辑要工作） */
+    if (!s_open || s_sink != AUDIO_SINK_SPK || !s_play_ok) return;
+
+    /* 本次 tick 该补多少 PCM：按真实时间差算，select 卡一下也不走音 */
+    static uint32_t last_ms;
+    if (last_ms == 0 || now < last_ms) last_ms = now;
+    uint32_t span = now - last_ms;
+    if (span < 20) return;
+    if (span > 100) span = 100;              /* 卡久了也别一次灌 1 秒 */
+    last_ms = now;
+
+    int n = (int)(span * RATE / 1000);
+    int16_t buf[800];                        /* 100ms @ 8k 的上限 */
+    uint32_t cyc = s_tone2.on_ms + s_tone2.off_ms;
+    uint32_t base = now - s_tone2.start_ms;
+
+    for (int i = 0; i < n; i++) {
+        uint32_t t = base + (uint32_t)i * 1000u / (uint32_t)RATE;
+        if (t % cyc < s_tone2.on_ms) {       /* 通段：450Hz 查表 */
+            buf[i] = (int16_t)((k_sine256[s_tone2.phase / 10] * TONE_AMPL) / 32767);
+            s_tone2.phase += TONE_450_IDX;
+            if (s_tone2.phase >= 2560) s_tone2.phase -= 2560;
+        } else {
+            buf[i] = 0;                      /* 断段：静音 */
+        }
+    }
+    ring_push(&s_play, buf, n);
+}
+
+/*---------------------------------------------------------------------------
  * 环操作（调用方负责加锁）
  *---------------------------------------------------------------------------*/
 static void ring_init(ring_t *r)
@@ -438,6 +579,7 @@ bool app_audio_open(void)
 void app_audio_close(void)
 {
     if (!s_open) return;
+    s_tone2.active = false;   /* 提示音跟着音频子系统一起关，别留到下次通话 */
     if (s_cap_dev)  { SDL_PauseAudioDevice(s_cap_dev, 1);  SDL_CloseAudioDevice(s_cap_dev);  s_cap_dev = 0; }
     if (s_play_dev) { SDL_PauseAudioDevice(s_play_dev, 1); SDL_CloseAudioDevice(s_play_dev); s_play_dev = 0; }
 
@@ -457,6 +599,14 @@ void app_audio_close(void)
 }
 
 bool app_audio_is_open(void) { return s_open; }
+
+void app_audio_call_end(void)
+{
+    /* 落盘模式：一次通话一个 wav，在这里收尾；下次 write 会自动开新文件 */
+    if (s_sink_fp) sink_wav_close();
+    app_audio_tone_stop();
+    s_tone2.warned = false;   /* 新通话重新给一次"没喇叭"的提示机会 */
+}
 
 bool app_audio_can_record(void)
 {
