@@ -6,6 +6,10 @@ bin/*.dll
 bin/*.o
 bin/*.a
 bin/stats.csv
+bin/stress_mem.csv
+bin/stress_rounds.txt
+bin/stress_a.log
+bin/stress_b_*.log
 logs/
 devices.ini
 # 现场配置含明文密码，只提交 config/sip.ini.example
