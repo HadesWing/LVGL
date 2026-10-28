@@ -241,6 +241,55 @@ def run_sweep(md, kwfile, paths, thrs, score):
     print("  0.05 也不命中          → 音素对不上，这个唤醒词的发音这个模型学不好，换词或换模型")
 
 
+def run_grid(md, kwfile, paths, thrs, scores):
+    """阈值 × 加分 二维扫描。
+
+    排查"有声音但检不出"的关键实验：阈值决定放行门槛，加分决定解码时给关键词
+    路径额外多少 boost。两个都要试，只看阈值容易误判成"音素对不上"。
+    """
+    print("阈值 × 加分 网格扫描（同一段音频，只改解码参数）\n")
+    spotters = {}
+    for t in thrs:
+        for s in scores:
+            spotters[(t, s)] = load_spotter(md, kwfile, t, s)
+
+    for p in paths:
+        try:
+            pcm, rate = read_wav_mono16k(p)
+        except Exception as e:                     # noqa: BLE001
+            print("  ❌ %s: %s" % (os.path.basename(p), e))
+            continue
+        print("音频 %s  时长 %.2fs" % (os.path.basename(p), len(pcm) / float(rate)))
+        head = "    阈值\\加分"
+        for s in scores:
+            head += " %8s" % ("%.1f" % s)
+        print(head)
+        best = None
+        for t in thrs:
+            line = "  %10.2f" % t
+            for s in scores:
+                stream = spotters[(t, s)].create_stream()
+                hits = feed_stream(spotters[(t, s)], stream, pcm, rate)
+                line += " %8s" % ("—" if not hits else "%d次" % len(hits))
+                if hits:
+                    # 命中数优先（稳），其次阈值高（少误报），再其次加分低（自然）
+                    key = (len(hits), t, -s)
+                    if best is None or key > best[0]:
+                        best = (key, t, s, len(hits))
+            print(line)
+        if best:
+            _, bt, bs, bn = best
+            print("  ➜ 推荐: --threshold %.2f --score %.1f （该格命中 %d 次，"
+                  "是表中命中最多且阈值最高的组合）" % (bt, bs, bn))
+        else:
+            print("  ➜ 全表无命中：这段音频的发音/音素与模型对不上，调阈值和加分都救不回来，"
+                  "换唤醒词或换更大的 KWS 模型。")
+        print("")
+    print("读法：")
+    print("  有命中的格子里次数越多越稳。优先选「阈值尽量高 + 加分尽量低」还能命中的那格，")
+    print("  这样误报最少；全表都是 — 说明这段音频的发音/音素确实对不上，换词或换模型。")
+
+
 def level_meter(pcm):
     """返回 (rms, peak, 20 格音量条)。dBFS 映射到 -60..0 dB，一眼看出麦克风在工作没。"""
     n = len(pcm)
@@ -417,6 +466,12 @@ def main():
                     help="阈值扫描：同一批 wav 用多个阈值各跑一遍，判断分数差多少")
     ap.add_argument("--sweep-thrs", default="0.05,0.10,0.15,0.20,0.25",
                     help="扫描用的阈值列表，逗号分隔")
+    ap.add_argument("--grid", action="store_true",
+                    help="阈值 × 加分 二维网格扫描（排查'有声音但检不出'最有效）")
+    ap.add_argument("--grid-thrs", default="0.05,0.10,0.15,0.20,0.25,0.30")
+    ap.add_argument("--grid-scores", default="1.0,1.5,2.0,3.0")
+    ap.add_argument("--autotune", action="store_true",
+                    help="--mic 录完后自动对这段录音跑一次网格，直接给出该用哪组参数")
     args = ap.parse_args()
 
     ffmpeg, ff_src = find_ffmpeg(args.ffmpeg)
@@ -456,6 +511,14 @@ def main():
         run_sweep(args.model_dir, args.keywords, args.wav, thrs, args.score)
         return 0
 
+    if args.grid:
+        if not args.wav:
+            die("--grid 需要给 wav 文件（先用 --mic --save-wav 录一段）")
+        thrs = [float(x) for x in args.grid_thrs.split(",") if x.strip()]
+        scores = [float(x) for x in args.grid_scores.split(",") if x.strip()]
+        run_grid(args.model_dir, args.keywords, args.wav, thrs, scores)
+        return 0
+
     kws = load_spotter(args.model_dir, args.keywords, args.threshold, args.score)
     print("模型: %s\n阈值 %.2f / 加分 %.2f / keywords: %s\n" %
           (args.model_dir, args.threshold, args.score, args.keywords))
@@ -473,6 +536,22 @@ def main():
             dev = devs[0]
         hits = run_mic(kws, ffmpeg, dev, save_wav=args.save_wav,
                        meter=not args.no_meter)
+        if not hits:
+            del kws                       # 先释放，网格要再建十几个 spotter
+            if args.save_wav and os.path.isfile(args.save_wav):
+                if args.autotune:
+                    print("\n本次未检出，自动对刚才这段录音做参数网格扫描……\n")
+                    thrs = [float(x) for x in args.grid_thrs.split(",") if x.strip()]
+                    scores = [float(x) for x in args.grid_scores.split(",") if x.strip()]
+                    run_grid(args.model_dir, args.keywords, [args.save_wav],
+                             thrs, scores)
+                else:
+                    print("\n本次 0 检出。录音已保存，加 --autotune 重跑即可自动调参，"
+                          "或手动：--grid \"%s\"" % args.save_wav)
+            else:
+                print("\n本次 0 检出，且没保存录音。建议加 --save-wav <路径> --autotune "
+                      "再录一次：\n"
+                      "  录音落盘后可以对同一段音频反复试参数，不必反复喊。")
         return 0 if hits else 2
 
     return 0 if run_wav(kws, args.wav) else 1
