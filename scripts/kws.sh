@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # 唤醒词测试启动器：自动挑一个装了 sherpa-onnx 的 Python 解释器
 #
-# 背景：Windows 上常同时存在多个 python（系统 Python / MSYS2 Python / 各种虚拟环境），
+# 背景：Windows 上常同时存在多个 python（conda 环境 / 系统 Python / MSYS2 / 各种虚拟环境），
 #      sherpa-onnx 只装在其中一个里。本脚本按顺序探测，用第一个 import 得通的跑。
+#
+# 首选 conda 环境 kws（D:\Program Files\anaconda3\envs\kws）：
+#   conda activate kws && python -m pip install sherpa-onnx sherpa-onnx-core
 #
 # 用法（参数原样透传给 kws_test.py）：
 #   ./scripts/kws.sh --mic
-#   ./scripts/kws.sh ../.tools/kws/test_wavs/*.wav
+#   ./scripts/kws.sh ../../.tools/kws/test_wavs/*.wav
 #   ./scripts/kws.sh --mic --threshold 0.15
 #   KWS_PYTHON=/c/Python314/python.exe ./scripts/kws.sh --mic   # 强制指定解释器
+#   KWS_ENV=other ./scripts/kws.sh --mic                        # 换一个 conda 环境名
 
 set -u
 
@@ -16,15 +20,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"   # 面试 工作区根
 MD="$ROOT/.tools/kws"
 KW="$MD/keywords_xixi.txt"
+ENVNAME="${KWS_ENV:-kws}"
 
 if [ ! -d "$MD" ]; then
   echo "错误: 模型目录不存在: $MD" >&2
   exit 1
 fi
 
-# 候选解释器：显式指定 > 系统 Python > WorkBuddy 内置 Python > MSYS2
 CANDS=()
 [ -n "${KWS_PYTHON:-}" ] && CANDS+=("$KWS_PYTHON")
+
+# 1) 当前已激活的就是目标 conda 环境
+if [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-}" = "$ENVNAME" ]; then
+  CANDS+=("$CONDA_PREFIX/python.exe")
+fi
+
+# 2) 已知 conda 根目录下的 <envs>/<ENVNAME>
+for root in "/d/Program Files/anaconda3" "/c/ProgramData/anaconda3" \
+            "/c/ProgramData/miniconda3" "$HOME/anaconda3" "$HOME/miniconda3"; do
+  CANDS+=("$root/envs/$ENVNAME/python.exe")
+done
+
+# 3) 兜底：系统 Python / WorkBuddy 内置 / MSYS2
 CANDS+=("/c/Python314/python.exe")
 for p in "$HOME"/.workbuddy/binaries/python/versions/*/python.exe; do
   [ -x "$p" ] && CANDS+=("$p")
@@ -44,7 +61,8 @@ if [ -z "$PY" ]; then
   echo "错误: 找不到装了 sherpa-onnx 的 Python。候选都试过了：" >&2
   for c in "${CANDS[@]}"; do echo "  $c" >&2; done
   echo "" >&2
-  echo "修复：/c/Python314/python.exe -m pip install sherpa-onnx sherpa-onnx-core" >&2
+  echo "修复（推荐装进 conda 环境 $ENVNAME）：" >&2
+  echo "  conda activate $ENVNAME && python -m pip install sherpa-onnx sherpa-onnx-core" >&2
   exit 1
 fi
 
