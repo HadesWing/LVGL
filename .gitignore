@@ -71,3 +71,7 @@ bin/loss_*.report
 # python 编译缓存（kws_test.py 等脚本跑出来的）
 __pycache__/
 *.pyc
+
+# python 编译缓存（kws_test.py 等脚本跑出来的）
+__pycache__/
+*.pyc
