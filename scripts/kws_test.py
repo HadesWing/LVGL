@@ -290,6 +290,94 @@ def run_grid(md, kwfile, paths, thrs, scores):
     print("  这样误报最少；全表都是 — 说明这段音频的发音/音素确实对不上，换词或换模型。")
 
 
+def split_speech(pcm, rate=16000, frame_ms=50, rel_thr=0.06,
+                 min_gap_ms=250, min_seg_ms=300, pad_ms=150, tail_ms=500):
+    """按能量把长录音切成一句一句，返回 [(起采样, 止采样)]。
+
+    用途：一段 40 秒录音里到底说了几句、哪几句没检出，比只看总命中数有用得多。
+    阈值取「峰值帧能量 × rel_thr」和绝对下限 60 的较大者，避免静音段被切进来。
+    句尾额外补 tail_ms 静音：KWS 要攒够 num_trailing_blanks 才会输出结果，
+    尾部不给静音会被判成"没说完"，逐句测就会出现假漏检。
+    """
+    n = max(1, int(rate * frame_ms / 1000))
+    frames = []                     # [(起采样, rms)]
+    for i in range(0, max(1, len(pcm) - n + 1), n):
+        blk = pcm[i:i + n]
+        e = 0
+        for v in blk:
+            e += v * v
+        frames.append((i, math.sqrt(e / float(len(blk)))))
+    if not frames:
+        return []
+    thr = max(60.0, max(r for _, r in frames) * rel_thr)
+    voiced = [(i, r > thr) for i, r in frames]
+
+    segs = []
+    start = None
+    last_on = None
+    gap_frames = max(1, int(min_gap_ms / frame_ms))
+    for idx, (i, on) in enumerate(voiced):
+        if on:
+            if start is None:
+                start = i
+            last_on = idx
+        elif start is not None and idx - last_on >= gap_frames:
+            segs.append((start, voiced[last_on][0] + n))
+            start = None
+    if start is not None and last_on is not None:
+        segs.append((start, voiced[last_on][0] + n))
+
+    pad = int(rate * pad_ms / 1000)
+    tail = int(rate * tail_ms / 1000)
+    min_len = int(rate * min_seg_ms / 1000)
+    out = []
+    for s, e in segs:
+        if e - s < min_len:
+            continue
+        out.append((max(0, s - pad), min(len(pcm), e + tail)))
+    return out
+
+
+def clip_ratio(pcm):
+    """满量程样本占比（%）。削顶会让 fbank 特征失真，是"有声音但检不出"的常见元凶。"""
+    if not pcm:
+        return 0.0
+    n = 0
+    for v in pcm:
+        if v >= 32700 or v <= -32700:
+            n += 1
+    return 100.0 * n / len(pcm)
+
+
+def run_segments(md, kwfile, path, thr, score):
+    """逐句诊断：把长录音切句，逐句跑检测，看漏在哪、漏的那些电平如何。"""
+    pcm, rate = read_wav_mono16k(path)
+    segs = split_speech(pcm, rate)
+    print("音频 %s  时长 %.2fs  切出 %d 句（阈值 %.2f / 加分 %.1f）\n"
+          % (os.path.basename(path), len(pcm) / float(rate), len(segs), thr, score))
+    if not segs:
+        print("  没切出语音段，可能全程静音或底噪判定异常")
+        return
+    kws = load_spotter(md, kwfile, thr, score)
+    print("   #   起(s)  长(s)    rms   peak  削顶%  结果")
+    hit = 0
+    for i, (s, e) in enumerate(segs, 1):
+        part = pcm[s:e]
+        rms, peak, _ = level_meter(part)
+        stream = kws.create_stream()
+        hits = feed_stream(kws, stream, part, rate)
+        if hits:
+            hit += 1
+        print("  %2d  %6.2f %6.2f %6d %6d %5.2f   %s"
+              % (i, s / float(rate), len(part) / float(rate), rms, peak,
+                 clip_ratio(part),
+                 ",".join(w for w, _ in hits) if hits else "—"))
+    print("\n  检出 %d / %d 句 (%.0f%%)" % (hit, len(segs), 100.0 * hit / len(segs)))
+    print("  漏检句电平明显偏低 → 先解决麦克风增益/距离；")
+    print("  削顶% 高的句子漏检 → 输入过载，把系统麦克风音量降到 70% 左右再录；")
+    print("  电平充足、无削顶仍漏检 → 模型对这个发音不敏感，调参救不回来。")
+
+
 def level_meter(pcm):
     """返回 (rms, peak, 20 格音量条)。dBFS 映射到 -60..0 dB，一眼看出麦克风在工作没。"""
     n = len(pcm)
@@ -472,6 +560,8 @@ def main():
     ap.add_argument("--grid-scores", default="1.0,1.5,2.0,3.0")
     ap.add_argument("--autotune", action="store_true",
                     help="--mic 录完后自动对这段录音跑一次网格，直接给出该用哪组参数")
+    ap.add_argument("--segments", action="store_true",
+                    help="逐句诊断：把长录音按能量切句，逐句跑检测，看漏在哪几句")
     args = ap.parse_args()
 
     ffmpeg, ff_src = find_ffmpeg(args.ffmpeg)
@@ -517,6 +607,14 @@ def main():
         thrs = [float(x) for x in args.grid_thrs.split(",") if x.strip()]
         scores = [float(x) for x in args.grid_scores.split(",") if x.strip()]
         run_grid(args.model_dir, args.keywords, args.wav, thrs, scores)
+        return 0
+
+    if args.segments:
+        if not args.wav:
+            die("--segments 需要给 wav 文件（先用 --mic --save-wav 录一段）")
+        for p in args.wav:
+            run_segments(args.model_dir, args.keywords, p,
+                         args.threshold, args.score)
         return 0
 
     kws = load_spotter(args.model_dir, args.keywords, args.threshold, args.score)

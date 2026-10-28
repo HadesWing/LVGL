@@ -3,14 +3,18 @@
 #
 # 背景：Windows 上常同时存在多个 python（conda 环境 / 系统 Python / MSYS2 / 各种虚拟环境），
 #      sherpa-onnx 只装在其中一个里。本脚本按顺序探测，用第一个 import 得通的跑。
+#      探测走绝对路径，**不需要 conda activate**。
 #
 # 首选 conda 环境 kws（D:\Program Files\anaconda3\envs\kws）：
 #   conda activate kws && python -m pip install sherpa-onnx sherpa-onnx-core
 #
-# 用法（参数原样透传给 kws_test.py）：
-#   ./scripts/kws.sh --mic
+# 用法（参数原样透传给被测脚本）：
+#   ./scripts/kws.sh --mic                       # KWS 实时
 #   ./scripts/kws.sh ../../.tools/kws/test_wavs/*.wav
-#   ./scripts/kws.sh --mic --threshold 0.15
+#   ./scripts/kws.sh --mic --save-wav x.wav --autotune
+#   ./scripts/kws.sh --grid x.wav                 # 阈值×加分 网格
+#   ./scripts/kws.sh --segments x.wav             # 逐句诊断
+#   KWS_SCRIPT=.../asr_wake_test.py ./scripts/kws.sh --wav x.wav
 #   KWS_PYTHON=/c/Python314/python.exe ./scripts/kws.sh --mic   # 强制指定解释器
 #   KWS_ENV=other ./scripts/kws.sh --mic                        # 换一个 conda 环境名
 
@@ -21,10 +25,16 @@ ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"   # 面试 工作区根
 MD="$ROOT/.tools/kws"
 KW="$MD/keywords_xixi.txt"
 ENVNAME="${KWS_ENV:-kws}"
+TARGET="${KWS_SCRIPT:-$SCRIPT_DIR/kws_test.py}"
 
-if [ ! -d "$MD" ]; then
-  echo "错误: 模型目录不存在: $MD" >&2
-  exit 1
+# 只有 kws_test.py 需要模型目录和关键词文件；asr_wake_test.py 自带默认值
+EXTRA=()
+if [ "$(basename "$TARGET")" = "kws_test.py" ]; then
+  if [ ! -d "$MD" ]; then
+    echo "错误: 模型目录不存在: $MD" >&2
+    exit 1
+  fi
+  EXTRA=(--model-dir "$MD" --keywords "$KW")
 fi
 
 CANDS=()
@@ -67,11 +77,12 @@ if [ -z "$PY" ]; then
 fi
 
 echo "[kws] 解释器: $PY"
-echo "[kws] 模型目录: $MD"
+echo "[kws] 被测脚本: $(basename "$TARGET")"
+if [ "${#EXTRA[@]}" -gt 0 ]; then echo "[kws] 模型目录: $MD"; fi
 
 # --mic 模式要靠 ffmpeg 抓 DirectShow 设备。
 # 优先用"解释器同环境"的 ffmpeg（conda 环境装在 <env>/Library/bin），这样不必 activate；
-# 没有才退到 MSYS2 安装。真正的选择由 kws_test.py 的 find_ffmpeg() 完成，这里只做 PATH 兜底。
+# 没有才退到 MSYS2 安装。真正的选择由被测脚本的 find_ffmpeg() 完成，这里只做 PATH 兜底。
 PYENV_DIR="$(dirname "$PY")"
 HAVE_ENV_FFMPEG=0
 for d in "$PYENV_DIR/Library/bin" "$PYENV_DIR/bin" "$PYENV_DIR"; do
@@ -90,7 +101,4 @@ fi
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
-exec "$PY" -u "$SCRIPT_DIR/kws_test.py" \
-  --model-dir "$MD" \
-  --keywords "$KW" \
-  "$@"
+exec "$PY" -u "$TARGET" "${EXTRA[@]}" "$@"
