@@ -146,31 +146,61 @@ def run_wav(kws, paths):
     return miss == 0 and err == 0
 
 
-def list_devices(ffmpeg):
-    out = subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true",
-                          "-f", "dshow", "-i", "dummy"],
-                         capture_output=True, text=True, errors="replace").stderr
-    # ffmpeg 版本之间设备名格式不同：
-    #   4.x  -> '  "麦克风 (Jabra)"'
-    #   5.x+ -> '"麦克风 (Jabra)" (audio)'
-    # 统一按"音频段里以引号开头的行"解析，取最后一个引号前的部分当名字。
+def enum_raw(ffmpeg):
+    """跑一遍 dshow 设备枚举，返回 ffmpeg 的 stderr 原文。"""
+    return subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true",
+                           "-f", "dshow", "-i", "dummy"],
+                          capture_output=True, text=True, errors="replace",
+                          encoding="utf-8").stderr or ""
+
+
+def parse_devices(out):
+    """从枚举输出里解析音频设备名。
+
+    ffmpeg 各版本格式不一样，必须同时兼容三种：
+      <= 8.x  有段标题：
+              '[dshow @ ...] DirectShow audio devices'
+              '[dshow @ ...]  "麦克风 (Jabra)"'
+      >= 9.0  没有段标题，改成行尾标注（9.0.2 实测）：
+              '[in#0 @ ...] "麦克风 (Jabra EVOLVE 30 II)" (audio)'
+              '[in#0 @ ...] Could not enumerate video devices (or none found).'
+    因此判定优先级：行尾 (audio)/(video) 标注 > 当前所在段标题。
+    """
     devs = []
     section = ""
     for line in out.splitlines():
-        if "DirectShow video devices" in line:
+        body = line.split("] ", 1)[-1].strip()
+        low = body.lower()
+        if "directshow video devices" in low:
             section = "video"
             continue
-        if "DirectShow audio devices" in line:
+        if "directshow audio devices" in low:
             section = "audio"
             continue
-        if section != "audio":
-            continue
-        body = line.split("] ", 1)[-1].strip()
         if not body.startswith('"') or body.count('"') < 2:
-            continue          # "Could not enumerate ..." / "Alternative name ..." 都在这被过滤
+            continue      # "Alternative name ..." / "Could not enumerate ..." 在这里被过滤
+        if body.endswith("(audio)"):
+            kind = "audio"
+        elif body.endswith("(video)"):
+            kind = "video"
+        else:
+            kind = section      # 旧版靠段标题
+        if kind != "audio":
+            continue
         name = body[1:body.rindex('"')]
         if name and name not in devs:
             devs.append(name)
+    return devs
+
+
+def list_devices(ffmpeg, dump=False):
+    out = enum_raw(ffmpeg)
+    if dump:
+        print("  --- ffmpeg 枚举原始输出 ---")
+        for ln in out.splitlines():
+            print("  | " + ln)
+        print("  --- 原始输出结束 ---")
+    devs = parse_devices(out)
     for i, d in enumerate(devs):
         print("  [%d] %s" % (i, d))
     return devs
@@ -323,6 +353,51 @@ def run_mic(kws, ffmpeg, device, save_wav="", meter=True):
     return hits
 
 
+def find_ffmpeg(hint=""):
+    """定位 ffmpeg，不依赖 conda activate / PATH 是否被初始化。
+
+    顺序：命令行 --ffmpeg > 环境变量 KWS_FFMPEG > 与当前解释器同环境的 ffmpeg
+    （conda 环境装在 <env>/Library/bin）> PATH > 几个已知绝对路径。
+    返回 (路径, 来源说明)，找不到返回 (None, "")。
+    """
+    cands = []
+    if hint:
+        cands.append((hint, "--ffmpeg"))
+    env = os.environ.get("KWS_FFMPEG", "")
+    if env:
+        cands.append((env, "KWS_FFMPEG"))
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    # conda 环境：python.exe 在 <env>\python.exe，ffmpeg 在 <env>\Library\bin
+    # 类 unix 布局：<env>/bin/python 同目录就是 bin
+    for sub in ("Library/bin", "bin", "Scripts",
+                os.path.join("..", "Library", "bin")):
+        cands.append((os.path.join(exe_dir, sub, "ffmpeg.exe"),
+                      "解释器同环境"))
+    w = shutil.which("ffmpeg")
+    if w:
+        cands.append((w, "PATH"))
+    for p in (r"C:\msys64\mingw64\bin\ffmpeg.exe",
+              r"C:\msys64\usr\bin\ffmpeg.exe",
+              r"D:\Program Files\anaconda3\envs\kws\Library\bin\ffmpeg.exe"):
+        cands.append((p, "已知路径"))
+    for path, src in cands:
+        if path and os.path.isfile(path):
+            return os.path.abspath(path), src
+    return None, ""
+
+
+def ffmpeg_version(ffmpeg):
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-version"],
+                             capture_output=True, text=True, errors="replace",
+                             encoding="utf-8").stdout or ""
+        first = out.splitlines()[0] if out else ""
+        m = re.search(r"version\s+(\S+)", first)
+        return m.group(1) if m else first.strip()
+    except Exception:                                  # noqa: BLE001
+        return "未知"
+
+
 def main():
     ap = argparse.ArgumentParser(description="离线唤醒词检测验证（sherpa-onnx KWS）")
     ap.add_argument("wav", nargs="*", help="待测 wav（16k 单声道 16bit）")
@@ -333,6 +408,8 @@ def main():
     ap.add_argument("--mic", action="store_true", help="实时麦克风模式")
     ap.add_argument("--device", default="", help="DirectShow 设备名（默认第一个音频设备）")
     ap.add_argument("--list-dev", action="store_true", help="列出音频设备")
+    ap.add_argument("--ffmpeg", default="", metavar="PATH",
+                    help="指定 ffmpeg 可执行文件（也可用 KWS_FFMPEG 环境变量）")
     ap.add_argument("--save-wav", default="", metavar="PATH",
                     help="--mic 时把采集到的 16k 单声道音频另存为 wav，便于离线复测")
     ap.add_argument("--no-meter", action="store_true", help="关闭实时电平条")
@@ -342,11 +419,27 @@ def main():
                     help="扫描用的阈值列表，逗号分隔")
     args = ap.parse_args()
 
-    ffmpeg = shutil.which("ffmpeg")
-    if args.list_dev:
+    ffmpeg, ff_src = find_ffmpeg(args.ffmpeg)
+    if args.list_dev or args.mic:
         if not ffmpeg:
-            die("PATH 里没有 ffmpeg")
-        list_devices(ffmpeg)
+            print("错误: 找不到 ffmpeg。试过：--ffmpeg 参数、KWS_FFMPEG、"
+                  "解释器同环境、PATH、C:\\msys64\\mingw64\\bin", file=sys.stderr)
+            print("      MSYS2 安装：pacman -S mingw-w64-x86_64-ffmpeg", file=sys.stderr)
+            print("      conda 安装：conda install -n kws -c conda-forge ffmpeg",
+                  file=sys.stderr)
+            return 1
+        print("[ffmpeg] %s（来源: %s，版本 %s）"
+              % (ffmpeg, ff_src, ffmpeg_version(ffmpeg)))
+
+    if args.list_dev:
+        devs = list_devices(ffmpeg, dump=not parse_devices(enum_raw(ffmpeg)))
+        if not devs:
+            print("\n没有解析到音频设备，上面是 ffmpeg 的原始输出。", file=sys.stderr)
+            print("若原始输出里能看到你的麦克风，说明是解析器不认这个版本的格式，"
+                  "把原始输出发出来即可；", file=sys.stderr)
+            print("若原始输出里也没有，用 --device \"设备名\" 手动指定，"
+                  "先确认 Windows 隐私设置允许桌面应用访问麦克风。", file=sys.stderr)
+            return 1
         return 0
 
     if not args.model_dir:
@@ -368,13 +461,15 @@ def main():
           (args.model_dir, args.threshold, args.score, args.keywords))
 
     if args.mic:
-        if not ffmpeg:
-            die("PATH 里没有 ffmpeg（MSYS2: /c/msys64/mingw64/bin）")
         dev = args.device
         if not dev:
-            devs = list_devices(ffmpeg)
+            devs = list_devices(ffmpeg, dump=True)
             if not devs:
-                die("找不到音频采集设备")
+                print("\n错误: 找不到音频采集设备（上面是 ffmpeg 原始输出）。",
+                      file=sys.stderr)
+                print("可用 --device \"设备名\" 手动指定；也要确认 Windows "
+                      "设置 > 隐私 > 麦克风 允许桌面应用访问。", file=sys.stderr)
+                return 1
             dev = devs[0]
         hits = run_mic(kws, ffmpeg, dev, save_wav=args.save_wav,
                        meter=not args.no_meter)

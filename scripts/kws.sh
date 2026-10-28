@@ -69,8 +69,15 @@ fi
 echo "[kws] 解释器: $PY"
 echo "[kws] 模型目录: $MD"
 
-# --mic 模式要靠 ffmpeg 抓 DirectShow 设备，缺了就补一条 MSYS2 路径进来
-if ! command -v ffmpeg >/dev/null 2>&1; then
+# --mic 模式要靠 ffmpeg 抓 DirectShow 设备。
+# 优先用"解释器同环境"的 ffmpeg（conda 环境装在 <env>/Library/bin），这样不必 activate；
+# 没有才退到 MSYS2 安装。真正的选择由 kws_test.py 的 find_ffmpeg() 完成，这里只做 PATH 兜底。
+PYENV_DIR="$(dirname "$PY")"
+HAVE_ENV_FFMPEG=0
+for d in "$PYENV_DIR/Library/bin" "$PYENV_DIR/bin" "$PYENV_DIR"; do
+  if [ -x "$d/ffmpeg.exe" ]; then HAVE_ENV_FFMPEG=1; break; fi
+done
+if [ "$HAVE_ENV_FFMPEG" = 0 ] && ! command -v ffmpeg >/dev/null 2>&1; then
   for d in /c/msys64/mingw64/bin /c/msys64/usr/bin; do
     if [ -x "$d/ffmpeg.exe" ]; then
       export PATH="$PATH:$d"
