@@ -303,9 +303,10 @@ def split_speech(pcm, rate=16000, frame_ms=50, rel_thr=0.06,
     frames = []                     # [(起采样, rms)]
     for i in range(0, max(1, len(pcm) - n + 1), n):
         blk = pcm[i:i + n]
-        e = 0
+        e = 0.0
         for v in blk:
-            e += v * v
+            fv = float(v)           # 必须是 float：numpy int16 相乘会溢出成负数
+            e += fv * fv
         frames.append((i, math.sqrt(e / float(len(blk)))))
     if not frames:
         return []
