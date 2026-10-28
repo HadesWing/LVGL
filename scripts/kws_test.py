@@ -149,7 +149,27 @@ def list_devices(ffmpeg):
     out = subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true",
                           "-f", "dshow", "-i", "dummy"],
                          capture_output=True, text=True, errors="replace").stderr
-    devs = re.findall(r'"([^"]+)" \(audio\)', out)
+    # ffmpeg 版本之间设备名格式不同：
+    #   4.x  -> '  "麦克风 (Jabra)"'
+    #   5.x+ -> '"麦克风 (Jabra)" (audio)'
+    # 统一按"音频段里以引号开头的行"解析，取最后一个引号前的部分当名字。
+    devs = []
+    section = ""
+    for line in out.splitlines():
+        if "DirectShow video devices" in line:
+            section = "video"
+            continue
+        if "DirectShow audio devices" in line:
+            section = "audio"
+            continue
+        if section != "audio":
+            continue
+        body = line.split("] ", 1)[-1].strip()
+        if not body.startswith('"') or body.count('"') < 2:
+            continue          # "Could not enumerate ..." / "Alternative name ..." 都在这被过滤
+        name = body[1:body.rindex('"')]
+        if name and name not in devs:
+            devs.append(name)
     for i, d in enumerate(devs):
         print("  [%d] %s" % (i, d))
     return devs
