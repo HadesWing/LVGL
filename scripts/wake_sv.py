@@ -35,6 +35,8 @@ TOKENS = os.path.join(MD, "tokens.txt")
 WAKE_HEAD = "你好"
 # 「你好」之后允许出现的近音字（兮兮/西西/嘻嘻/熙熙/欣欣…都被 ASR 听过）
 WAKE_TAIL = set("兮西嘻熙希溪喜息细析心欣新鑫")
+# 整词直接命中（换成「你好小智」这类词时走这条，不依赖近音表）
+WAKE_WORDS = ["小智小智", "你好小智", "你好兮兮"]
 
 PUNCT = "，。！？、,.!? \u3000:：;；\"'“”‘’"
 
@@ -43,11 +45,14 @@ def clean(text):
     return "".join(c for c in text if c not in PUNCT)
 
 
-def match_wake(text):
+def match_wake(text, words=None):
     """返回命中的唤醒词片段，否则 None。"""
     t = clean(text)
     if not t:
         return None
+    for w in (words or WAKE_WORDS):
+        if w and w in t:
+            return w
     start = 0
     while True:
         i = t.find(WAKE_HEAD, start)
@@ -185,7 +190,12 @@ def main():
     ap.add_argument("--save-wav", default="", help="--mic 时把采集音频落盘")
     ap.add_argument("--no-meter", action="store_true", help="关闭电平条")
     ap.add_argument("--quiet-ms", type=int, default=600, help="判定一句话结束的静音时长")
+    ap.add_argument("--words", default="", help="逗号分隔的唤醒词（默认内置一组）")
     a = ap.parse_args()
+    if a.words:
+        global WAKE_WORDS
+        WAKE_WORDS = [w.strip() for w in a.words.split(",")]
+        print("[唤醒词] %s" % " / ".join(WAKE_WORDS))
     rc = Recognizer()
     if a.mic:
         return run_mic(rc, a.device, a.save_wav, a.quiet_ms, meter=not a.no_meter)
