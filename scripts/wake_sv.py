@@ -35,6 +35,8 @@ TOKENS = os.path.join(MD, "tokens.txt")
 WAKE_HEAD = "你好"
 # 「你好」之后允许出现的近音字（兮兮/西西/嘻嘻/熙熙/欣欣…都被 ASR 听过）
 WAKE_TAIL = set("兮西嘻熙希溪喜息细析心欣新鑫")
+# 「智」的近音：ASR 实测把「小智」听成「小志」（同音不同字），必须宽容
+ZHI = "智志知治制质"
 # 整词直接命中（换成「你好小智」这类词时走这条，不依赖近音表）
 WAKE_WORDS = ["小智小智", "你好小智", "你好兮兮"]
 
@@ -46,13 +48,23 @@ def clean(text):
 
 
 def match_wake(text, words=None):
-    """返回命中的唤醒词片段，否则 None。"""
+    """返回命中的唤醒词片段，否则 None。
+
+    三条路径：整词命中 → 「你好+近音字」（兮兮类）→ 「你好+小X」（小智类）。
+    「小智」必须容忍同音字：实测 SenseVoice 会把「你好小智」听成「你好小志」，
+    不宽容就等于白丢一次唤醒。
+    """
     t = clean(text)
     if not t:
         return None
     for w in (words or WAKE_WORDS):
         if w and w in t:
             return w
+    # 叠词：小智小智
+    for i in range(len(t) - 3):
+        if t[i] == "小" and t[i + 1] in ZHI and t[i + 2] == "小" and t[i + 3] in ZHI:
+            return "小智小智"
+    # 「你好」+ 近音尾字（兮兮类 或 小智类）
     start = 0
     while True:
         i = t.find(WAKE_HEAD, start)
@@ -61,6 +73,8 @@ def match_wake(text, words=None):
         tail = t[i + len(WAKE_HEAD): i + len(WAKE_HEAD) + 2]
         if any(c in WAKE_TAIL for c in tail):
             return (WAKE_HEAD + tail).strip()
+        if len(tail) >= 2 and tail[0] == "小" and tail[1] in ZHI:
+            return WAKE_HEAD + tail
         start = i + 1
 
 
