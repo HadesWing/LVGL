@@ -556,6 +556,12 @@ TOOLCHAIN=cmake/arm-linux.cmake make release
 - [x] **产品规划**：智能家居中控台三大功能拆解（`docs/产品规划_智能家居中控台.md`）
 - [x] **M1**：中控台骨架 —— flex/grid 主页 + **三级信息架构**（分类宫格 → 房间页签 → 设备详情）+ 设备模型 + 事件总线 + ini 持久化
 - [ ] **M2**：语音链路 —— voice_engine 四实现（mock/**sherpa-onnx**/思必驰/在线）+ 唤醒状态机 + 语音浮层 + 中文意图解析（**当前用 app_mock 模拟 ASR 事件**）
+  - [x] **M2-a 唤醒方案定案**（研究阶段完成，尚未接进 `voice_engine`）：唤醒词定 **「你好小智」**；
+    管线 = 流式 zipformer(24MB) + 能量 VAD 门控 + 同音字归一后处理 → 连续音流实测（4 个随机种子）
+    **「你好小智」检出 15/16 = 94%、误唤醒 0/24、延迟 50ms、RTF 0.0144**；
+    归一化规则已写成可上板 C（`scripts/wake_norm.c/.h`，16 条用例全绿）。
+    见 `docs/语音唤醒_流式端点评测_真实链路.md`、`docs/语音唤醒_三方案实测_官方量化_热词_同音字.md`、
+    `docs/语音唤醒_从零讲透_原理与两套方案对比.md`
 - [x] **M3**：SIP 对讲 —— oSIP 客户端（REGISTER/Digest/续期、INVITE 双向、ACK/BYE/CANCEL、非 2xx ACK、**G.711 真实音频**）+ `ui_call.c` 对讲页；真服务器 miniSIPServer 实测：**50pps/64kbps，收发 250↔250，欠载 0**；另有板端自测工具 `tools/sip_echo`（纯 C 应答器，陪产品一起上板）；音频收发两条通路已用 file↔file 方式独立验收（SNR 43.1 dB、丢包 0），并用 **`make duo` 双进程对打**做了真双向验证（室内机→客户端 / 客户端→室内机，各 12s：tx/rx 600↔600、loss 0.00%、SNR 43.1 dB）。**视频接收全链路已通**：`h264_depack`（单NAL/STAP-A/FU-A，按 RTP 时间戳切 AU）→ `vdec`（PC 用 libavcodec，板子换 MPP）→ `app_video`；`make duo-video` 实测 **299/299 帧逐字节 bit-exact**（`fu_broken=0`、`dec err=0`）。**上屏也已打通**：`yuv2rgb` 缩放到 288×216 转 RGB565，3 槽位跨线程交接（丢旧留新），`make duo-disp` 抓屏与参考帧 **62208/62208 逐像素相同**。见 `docs/SIP联调环境.md`、`docs/音频通路自测方案.md`（第 9 节）、`docs/视频接收链路验证.md`、`docs/视频上屏验证.md`
 - [x] **M4（部分）**：中文按需子集字库（`scripts/gen_font.py` → `src/ui/fonts/`，212 汉字 × 16/24px），**修掉了"灯/调/风/插/线"显示成方框的问题**
 - [x] **OEM 定制层**（超出原计划）：`src/oem/` 一套接口 + 两套 profile，运行期 `OEM_PROFILE=alt` 热切换宫格/列表两套首页，见 `docs/OEM定制指南.md`
